@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-gl/gl/v4.3-core/gl"
 	"go-quake/bsp"
+	"go-quake/vis"
 )
 
 // LeafDescGPU mirrors the GLSL LeafDesc struct (std430).
@@ -18,25 +19,26 @@ type LeafDescGPU struct {
 
 // ComputeState holds SSBO handles and compute program.
 type ComputeState struct {
-	ssboPVS         uint32 // binding 0
+	m               *bsp.Map
+	ssboPVSBitset   uint32 // binding 0: precomputed PVS bitset for current leaf
 	ssboLeafTable   uint32 // binding 1
 	ssboMarkSurface uint32 // binding 2
 	ssboVisFlags    uint32 // binding 3
-	ubo             uint32 // binding 0
+	ubo             uint32
 
-	computeProg uint32
-	numFaces    uint32
-	numLeafs    uint32
+	computeProg  uint32
+	numFaces     uint32
+	numLeafs     uint32
+	lastLeaf     int // last leaf for which the PVS bitset was uploaded
 }
 
 // uboData matches the GLSL FrameUBO layout (std140).
 type uboData struct {
-	CurrentLeaf uint32
-	TotalLeafs  uint32
-	_pad        [2]uint32
+	TotalLeafs uint32
+	_pad       [3]uint32
 }
 
-// InitCompute uploads all BSP vis data to GPU SSBOs.
+// InitCompute uploads BSP leaf/marksurface data to GPU SSBOs.
 func InitCompute(m *bsp.Map, computeSrc string) (*ComputeState, error) {
 	prog, err := compileCompute(computeSrc)
 	if err != nil {
@@ -44,14 +46,25 @@ func InitCompute(m *bsp.Map, computeSrc string) (*ComputeState, error) {
 	}
 
 	cs := &ComputeState{
+		m:           m,
 		computeProg: prog,
 		numFaces:    uint32(len(m.Faces)),
 		numLeafs:    uint32(len(m.Leaves)),
+		lastLeaf:    -1, // force upload on first frame
 	}
 
-	// SSBO 0: PVS bytes — pack into uint32 array
-	pvsUints := bytesToUint32(m.VisData)
-	cs.ssboPVS = makeSSBO(0, pvsUints)
+	// SSBO 0: PVS bitset — one bit per leaf, updated by CPU each time the player
+	// changes leaf. Size: ceil(numLeafs/32) uint32s.
+	bitsetSize := ((len(m.Leaves) + 31) / 32) * 4
+	if bitsetSize == 0 {
+		bitsetSize = 4
+	}
+	var pvsSsbo uint32
+	gl.GenBuffers(1, &pvsSsbo)
+	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, pvsSsbo)
+	gl.BufferData(gl.SHADER_STORAGE_BUFFER, bitsetSize, nil, gl.DYNAMIC_DRAW)
+	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, pvsSsbo)
+	cs.ssboPVSBitset = pvsSsbo
 
 	// SSBO 1: leaf descriptors
 	leafDescs := make([]LeafDescGPU, len(m.Leaves))
@@ -75,7 +88,7 @@ func InitCompute(m *bsp.Map, computeSrc string) (*ComputeState, error) {
 	}
 	cs.ssboMarkSurface = makeSSBO(2, ms)
 
-	// SSBO 3: visible face flags (output) — allocated, zeroed each frame
+	// SSBO 3: visible face flags (output) — zeroed each frame
 	cs.ssboVisFlags = makeSSBOEmpty(3, int(cs.numFaces)*4)
 
 	// UBO
@@ -87,19 +100,35 @@ func InitCompute(m *bsp.Map, computeSrc string) (*ComputeState, error) {
 	return cs, nil
 }
 
-// Dispatch zeros visFlags SSBO, updates UBO, dispatches compute shader.
-func (cs *ComputeState) Dispatch(currentLeaf uint32) {
+// Dispatch zeros visFlags, updates the PVS bitset if the leaf changed, and
+// dispatches the compute shader.
+func (cs *ComputeState) Dispatch(currentLeaf int) {
+	// Re-upload PVS bitset whenever the player changes leaf.
+	if currentLeaf != cs.lastLeaf {
+		cs.lastLeaf = currentLeaf
+
+		var visofs int32 = -1
+		if currentLeaf >= 0 && currentLeaf < len(cs.m.Leaves) {
+			visofs = cs.m.Leaves[currentLeaf].VisOfs
+		}
+		pvs := vis.DecompressPVS(cs.m.VisData, visofs, len(cs.m.Leaves))
+		bitset := pvsToBitset(pvs, len(cs.m.Leaves))
+
+		gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, cs.ssboPVSBitset)
+		gl.BufferSubData(gl.SHADER_STORAGE_BUFFER, 0, len(bitset)*4, unsafe.Pointer(&bitset[0]))
+	}
+
 	// Zero output SSBO
 	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, cs.ssboVisFlags)
 	gl.ClearBufferData(gl.SHADER_STORAGE_BUFFER, gl.R32UI, gl.RED_INTEGER, gl.UNSIGNED_INT, nil)
 
 	// Update UBO
-	data := uboData{CurrentLeaf: currentLeaf, TotalLeafs: cs.numLeafs}
+	data := uboData{TotalLeafs: cs.numLeafs}
 	gl.BindBuffer(gl.UNIFORM_BUFFER, cs.ubo)
 	gl.BufferSubData(gl.UNIFORM_BUFFER, 0, int(unsafe.Sizeof(data)), unsafe.Pointer(&data))
 
 	// Bind SSBOs
-	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, cs.ssboPVS)
+	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 0, cs.ssboPVSBitset)
 	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 1, cs.ssboLeafTable)
 	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 2, cs.ssboMarkSurface)
 	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 3, cs.ssboVisFlags)
@@ -131,22 +160,29 @@ func (cs *ComputeState) CountVisible() int {
 	return count
 }
 
-func bytesToUint32(b []byte) []uint32 {
-	if len(b) == 0 {
-		return []uint32{0} // non-empty so GL doesn't complain
+// pvsToBitset converts a decompressed PVS byte slice to a uint32 bitset.
+// nil pvs means all-visible (all bits set).
+// Bit (leafIdx-1) of the result indicates whether leafIdx is visible.
+func pvsToBitset(pvs []byte, numLeafs int) []uint32 {
+	size := (numLeafs + 31) / 32
+	if size == 0 {
+		size = 1
 	}
-	// Pad to multiple of 4
-	for len(b)%4 != 0 {
-		b = append(b, 0)
+	result := make([]uint32, size)
+	if pvs == nil {
+		for i := range result {
+			result[i] = 0xFFFFFFFF
+		}
+		return result
 	}
-	out := make([]uint32, len(b)/4)
-	for i := range out {
-		out[i] = uint32(b[i*4]) |
-			uint32(b[i*4+1])<<8 |
-			uint32(b[i*4+2])<<16 |
-			uint32(b[i*4+3])<<24
+	for i, b := range pvs {
+		w := i / 4
+		if w >= size {
+			break
+		}
+		result[w] |= uint32(b) << uint((i%4)*8)
 	}
-	return out
+	return result
 }
 
 func makeSSBO(binding int, data interface{}) uint32 {
@@ -170,7 +206,7 @@ func makeSSBO(binding int, data interface{}) uint32 {
 	}
 
 	if size == 0 {
-		size = 4 // ensure non-zero
+		size = 4
 	}
 	gl.BufferData(gl.SHADER_STORAGE_BUFFER, size, ptr, gl.STATIC_DRAW)
 	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, uint32(binding), ssbo)

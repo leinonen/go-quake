@@ -118,7 +118,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.ClearColor(0.1, 0.1, 0.15, 1.0)
 
 	if r.usePVS {
-		r.compute.Dispatch(uint32(frame.Player.LeafIndex))
+		r.compute.Dispatch(frame.Player.LeafIndex)
 	}
 
 	proj := mgl32.Perspective(mgl32.DegToRad(90), float32(width)/float32(height), 4, 16384)

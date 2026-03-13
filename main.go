@@ -156,10 +156,29 @@ func main() {
 		}
 	})
 
+	// Watchdog: if the main loop stalls for >3s, dump all goroutine stacks.
+	watchdog := make(chan struct{}, 1)
+	go func() {
+		for {
+			select {
+			case <-watchdog:
+				// heartbeat received, keep watching
+			case <-time.After(3 * time.Second):
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				fmt.Fprintf(os.Stderr, "\n=== HANG DETECTED — goroutine dump ===\n%s\n", buf[:n])
+			}
+		}
+	}()
+
 	var lastTime = time.Now()
-	var debugTick int
+	var debugTick uint
 
 	for !win.ShouldClose() {
+		select {
+		case watchdog <- struct{}{}:
+		default:
+		}
 		glfw.PollEvents()
 		input.Pump(win, bus, &lastTime)
 
@@ -176,11 +195,9 @@ func main() {
 
 		debugTick++
 		if debugTick%30 == 0 {
-			visCount := rend.CountVisible()
-			total := rend.NumFaces()
 			pos := [3]float32(playerState.Position)
-			title := fmt.Sprintf("go-quake | leaf %d | visible: %d / %d | pos: %.0f %.0f %.0f",
-				playerState.LeafIndex, visCount, total, pos[0], pos[1], pos[2])
+			title := fmt.Sprintf("go-quake | leaf %d | pos: %.0f %.0f %.0f",
+				playerState.LeafIndex, pos[0], pos[1], pos[2])
 			win.SetTitle(title)
 		}
 
@@ -188,4 +205,11 @@ func main() {
 	}
 
 	close(bus.Shutdown)
+
+	// Restore cursor before GLFW teardown. On Linux/X11, destroying a window
+	// with CursorDisabled active can block glfwTerminate waiting for the pointer
+	// ungrab to complete. Resetting to Normal and flushing events lets GLFW
+	// finish cleanly.
+	win.SetInputMode(glfw.CursorMode, glfw.CursorNormal)
+	glfw.PollEvents()
 }

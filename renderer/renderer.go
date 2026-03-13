@@ -26,12 +26,13 @@ type Renderer struct {
 	vbo         uint32
 	numVerts    int32
 
-	compute     *ComputeState
-	usePVS      bool
-	numFaces    uint32
+	compute        *ComputeState
+	usePVS         bool
+	numFaces       uint32
+	ssboBrightness uint32
 
-	mvpLoc      int32
-	usePVSLoc   int32
+	mvpLoc       int32
+	usePVSLoc    int32
 	totalFaceLoc int32
 }
 
@@ -78,6 +79,10 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string) (*Renderer, error) {
 	}
 	r.compute = cs
 
+	// Brightness SSBO (binding 4)
+	brightness := bsp.FaceBrightness(m)
+	r.ssboBrightness = makeBrightnessSSBO(brightness)
+
 	// Depth test + face cull
 	gl.Enable(gl.DEPTH_TEST)
 	gl.Enable(gl.CULL_FACE)
@@ -118,6 +123,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.Uniform1ui(r.totalFaceLoc, r.numFaces)
 
 	r.compute.BindVisFlags()
+	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 4, r.ssboBrightness)
 	gl.BindVertexArray(r.vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, r.numVerts)
 	gl.BindVertexArray(0)
@@ -138,11 +144,17 @@ func boolToInt32(b bool) int32 {
 	return 0
 }
 
-// buildWorldVerts triangulates all BSP faces into a flat float32 slice.
+// buildWorldVerts triangulates world model (Models[0]) BSP faces into a flat float32 slice.
+// Sub-models (Models[1..N]) are brush entities (doors, platforms) and are excluded.
 // Each vertex: x, y, z, faceIndex (as float32).
 func buildWorldVerts(m *bsp.Map) []float32 {
+	world := m.Models[0]
+	firstFace := int(world.FirstFace)
+	lastFace := firstFace + int(world.NumFaces)
+
 	var verts []float32
-	for faceIdx, face := range m.Faces {
+	for faceIdx := firstFace; faceIdx < lastFace; faceIdx++ {
+		face := m.Faces[faceIdx]
 		fi := float32(faceIdx)
 		// Collect face vertices via surfedges
 		faceVs := make([][3]float32, 0, face.NumEdges)
@@ -206,6 +218,15 @@ func compileShader(src string, shaderType uint32) (uint32, error) {
 		return 0, fmt.Errorf("shader compile: %s", log)
 	}
 	return shader, nil
+}
+
+func makeBrightnessSSBO(brightness []float32) uint32 {
+	var ssbo uint32
+	gl.GenBuffers(1, &ssbo)
+	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, ssbo)
+	gl.BufferData(gl.SHADER_STORAGE_BUFFER, len(brightness)*4, unsafe.Pointer(&brightness[0]), gl.STATIC_DRAW)
+	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, 0)
+	return ssbo
 }
 
 func linkProgram(shaders ...uint32) (uint32, error) {

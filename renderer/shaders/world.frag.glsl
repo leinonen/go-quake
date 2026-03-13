@@ -7,20 +7,15 @@ layout(std430, binding = 3) readonly buffer VisibleFaces {
     uint visibleFaceFlags[];
 };
 
+// SSBO 4: per-face brightness from baked lightmaps
+layout(std430, binding = 4) readonly buffer FaceBrightness {
+    float faceBrightness[];
+};
+
 uniform bool uUsePVS;
 uniform uint uTotalFaces;
-uniform vec3 uFaceColor;
 
 out vec4 fragColor;
-
-// Simple hash for per-face color variety
-vec3 faceColor(uint idx) {
-    uint h = idx * 1664525u + 1013904223u;
-    float r = float((h >> 16u) & 0xFFu) / 255.0;
-    float g = float((h >> 8u)  & 0xFFu) / 255.0;
-    float b = float( h         & 0xFFu) / 255.0;
-    return vec3(r * 0.6 + 0.2, g * 0.6 + 0.2, b * 0.6 + 0.2);
-}
 
 void main() {
     if (uUsePVS && vFaceIndex < uTotalFaces) {
@@ -28,5 +23,15 @@ void main() {
             discard;
         }
     }
-    fragColor = vec4(faceColor(vFaceIndex), 1.0);
+    float b = (vFaceIndex < uTotalFaces) ? faceBrightness[vFaceIndex] : 1.0;
+    if (b >= 2.5) {
+        // Water: deep blue
+        fragColor = vec4(0.05, 0.2, 0.55, 1.0);
+    } else if (b >= 1.5) {
+        // Sky: light blue
+        fragColor = vec4(0.35, 0.55, 0.85, 1.0);
+    } else {
+        b = pow(b, 0.75); // mild gamma lift — Quake lightmaps are linear, dark on modern displays
+        fragColor = vec4(vec3(b), 1.0);
+    }
 }

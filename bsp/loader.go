@@ -20,6 +20,9 @@ type Map struct {
 	Edges        []DEdge
 	SurfEdges    []int32
 	Models       []DModel
+	TexInfos     []DTexInfo
+	LightData    []byte
+	TextureNames []string // indexed by MipTex field of DTexInfo
 }
 
 // Load parses a BSP29 file from disk path.
@@ -135,6 +138,48 @@ func parse(f interface {
 	} else {
 		m.Models = make([]DModel, len(buf)/64)
 		readStructSlice(buf, m.Models)
+	}
+
+	if buf, err := readLump(LumpTexInfo, 40); err != nil {
+		return nil, err
+	} else {
+		m.TexInfos = make([]DTexInfo, len(buf)/40)
+		readStructSlice(buf, m.TexInfos)
+	}
+
+	if l := header.Lumps[LumpLighting]; l.Length > 0 {
+		m.LightData = make([]byte, l.Length)
+		if _, err := f.ReadAt(m.LightData, int64(l.Offset)); err != nil {
+			return nil, fmt.Errorf("read lighting: %w", err)
+		}
+	}
+
+	// Parse texture names from the MipTex lump (lump 2).
+	// Layout: int32 count, int32 offsets[count], then at each offset: char name[16] ...
+	if l := header.Lumps[LumpTextures]; l.Length >= 4 {
+		raw := make([]byte, l.Length)
+		if _, err := f.ReadAt(raw, int64(l.Offset)); err != nil {
+			return nil, fmt.Errorf("read textures: %w", err)
+		}
+		count := int(int32(raw[0]) | int32(raw[1])<<8 | int32(raw[2])<<16 | int32(raw[3])<<24)
+		m.TextureNames = make([]string, count)
+		for i := 0; i < count; i++ {
+			offIdx := 4 + i*4
+			if offIdx+4 > len(raw) {
+				break
+			}
+			off := int(int32(raw[offIdx]) | int32(raw[offIdx+1])<<8 | int32(raw[offIdx+2])<<16 | int32(raw[offIdx+3])<<24)
+			if off < 0 || off+16 > len(raw) {
+				continue
+			}
+			// name is a null-terminated 16-byte field
+			name := raw[off : off+16]
+			end := 0
+			for end < 16 && name[end] != 0 {
+				end++
+			}
+			m.TextureNames[i] = string(name[:end])
+		}
 	}
 
 	return m, nil

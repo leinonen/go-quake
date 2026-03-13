@@ -78,6 +78,13 @@ type DEdge struct {
 	V [2]uint16
 }
 
+// DTexInfo is an on-disk texture info record (lump 6, 40 bytes).
+type DTexInfo struct {
+	Vecs   [2][4]float32 // s and t axis vectors + offsets (32 bytes)
+	MipTex int32
+	Flags  int32
+}
+
 // DModel is a BSP model (world + brush entities).
 type DModel struct {
 	Mins      [3]float32

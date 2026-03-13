@@ -13,12 +13,6 @@ import (
 	"go-quake/game"
 )
 
-// FaceVerts holds the triangulated vertex data for one face.
-type FaceVerts struct {
-	Verts     []float32 // x,y,z, faceIndex (4 floats per vertex)
-	FaceIndex uint32
-}
-
 // Renderer owns all GL state and draws the world.
 type Renderer struct {
 	worldProg   uint32
@@ -26,35 +20,59 @@ type Renderer struct {
 	vbo         uint32
 	numVerts    int32
 
-	compute        *ComputeState
-	usePVS         bool
-	numFaces       uint32
-	ssboBrightness uint32
+	compute          *ComputeState
+	usePVS           bool
+	numFaces         uint32
+	ssboBrightness   uint32
+	ssboFaceAtlas    uint32
+	atlasTexture     uint32
+	atlasW, atlasH   int32
 
-	mvpLoc       int32
-	usePVSLoc    int32
-	totalFaceLoc int32
+	mvpLoc         int32
+	usePVSLoc      int32
+	totalFaceLoc   int32
+	atlasLoc       int32
+	atlasSizeLoc   int32
 }
 
 // Init initialises GL state and uploads BSP geometry.
-func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string) (*Renderer, error) {
+// palette is 768 bytes (256 RGB triplets) from gfx/palette.lmp; nil uses index-as-grey fallback.
+func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string, palette []byte) (*Renderer, error) {
 	prog, err := compileRender(vertSrc, fragSrc)
 	if err != nil {
 		return nil, fmt.Errorf("compile render shaders: %w", err)
 	}
 
 	r := &Renderer{
-		worldProg:    prog,
-		numFaces:     uint32(len(m.Faces)),
-		usePVS:       true,
+		worldProg: prog,
+		numFaces:  uint32(len(m.Faces)),
+		usePVS:    true,
 	}
 	r.mvpLoc = gl.GetUniformLocation(prog, gl.Str("uMVP\x00"))
 	r.usePVSLoc = gl.GetUniformLocation(prog, gl.Str("uUsePVS\x00"))
 	r.totalFaceLoc = gl.GetUniformLocation(prog, gl.Str("uTotalFaces\x00"))
+	r.atlasLoc = gl.GetUniformLocation(prog, gl.Str("uAtlas\x00"))
+	r.atlasSizeLoc = gl.GetUniformLocation(prog, gl.Str("uAtlasSize\x00"))
 
-	// Build vertex buffer from BSP faces
+	// Build texture atlas
+	atlasPixels, aw, ah, rects := buildAtlas(m.MipTexes, palette)
+	r.atlasW, r.atlasH = int32(aw), int32(ah)
+
+	gl.GenTextures(1, &r.atlasTexture)
+	gl.BindTexture(gl.TEXTURE_2D, r.atlasTexture)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, r.atlasW, r.atlasH, 0, gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&atlasPixels[0]))
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.BindTexture(gl.TEXTURE_2D, 0)
+
+	// Per-face atlas info SSBO (binding 5): vec4{atlasX, atlasY, texW, texH} in pixels
+	r.ssboFaceAtlas = buildFaceAtlasSSBO(m, rects)
+
+	// Build vertex buffer from BSP faces (6 floats per vertex: x,y,z, faceIdx, s, t)
 	verts := buildWorldVerts(m)
-	r.numVerts = int32(len(verts) / 4) // 4 floats per vertex
+	r.numVerts = int32(len(verts) / 6)
 
 	gl.GenVertexArrays(1, &r.vao)
 	gl.BindVertexArray(r.vao)
@@ -63,12 +81,15 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string) (*Renderer, error) {
 	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
 	gl.BufferData(gl.ARRAY_BUFFER, len(verts)*4, unsafe.Pointer(&verts[0]), gl.STATIC_DRAW)
 
-	// aPos
+	// aPos (location 0): 3 floats at offset 0, stride 24
 	gl.EnableVertexAttribArray(0)
-	gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 16, 0)
-	// aFaceIndex
+	gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 24, 0)
+	// aFaceIndex (location 1): 1 float at offset 12
 	gl.EnableVertexAttribArray(1)
-	gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 16, 12)
+	gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 24, 12)
+	// aTexST (location 2): 2 floats at offset 16
+	gl.EnableVertexAttribArray(2)
+	gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 24, 16)
 
 	gl.BindVertexArray(0)
 
@@ -124,6 +145,13 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 
 	r.compute.BindVisFlags()
 	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 4, r.ssboBrightness)
+	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 5, r.ssboFaceAtlas)
+
+	gl.ActiveTexture(gl.TEXTURE0)
+	gl.BindTexture(gl.TEXTURE_2D, r.atlasTexture)
+	gl.Uniform1i(r.atlasLoc, 0)
+	gl.Uniform2f(r.atlasSizeLoc, float32(r.atlasW), float32(r.atlasH))
+
 	gl.BindVertexArray(r.vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, r.numVerts)
 	gl.BindVertexArray(0)
@@ -146,7 +174,7 @@ func boolToInt32(b bool) int32 {
 
 // buildWorldVerts triangulates world model (Models[0]) BSP faces into a flat float32 slice.
 // Sub-models (Models[1..N]) are brush entities (doors, platforms) and are excluded.
-// Each vertex: x, y, z, faceIndex (as float32).
+// Each vertex: x, y, z, faceIndex, s, t (6 floats; s/t are raw pixel-space texture coords).
 func buildWorldVerts(m *bsp.Map) []float32 {
 	world := m.Models[0]
 	firstFace := int(world.FirstFace)
@@ -156,6 +184,15 @@ func buildWorldVerts(m *bsp.Map) []float32 {
 	for faceIdx := firstFace; faceIdx < lastFace; faceIdx++ {
 		face := m.Faces[faceIdx]
 		fi := float32(faceIdx)
+
+		// Texture projection vectors for this face
+		var sv, tv [4]float32
+		if int(face.TexInfo) < len(m.TexInfos) {
+			ti := m.TexInfos[face.TexInfo]
+			sv = ti.Vecs[0]
+			tv = ti.Vecs[1]
+		}
+
 		// Collect face vertices via surfedges
 		faceVs := make([][3]float32, 0, face.NumEdges)
 		for i := 0; i < int(face.NumEdges); i++ {
@@ -172,11 +209,104 @@ func buildWorldVerts(m *bsp.Map) []float32 {
 		// Fan triangulation from vertex 0
 		for i := 1; i+1 < len(faceVs); i++ {
 			for _, vtx := range [][3]float32{faceVs[0], faceVs[i], faceVs[i+1]} {
-				verts = append(verts, vtx[0], vtx[1], vtx[2], fi)
+				s := vtx[0]*sv[0] + vtx[1]*sv[1] + vtx[2]*sv[2] + sv[3]
+				t := vtx[0]*tv[0] + vtx[1]*tv[1] + vtx[2]*tv[2] + tv[3]
+				verts = append(verts, vtx[0], vtx[1], vtx[2], fi, s, t)
 			}
 		}
 	}
 	return verts
+}
+
+// buildAtlas packs all miptex greyscale pixels into a single 2D atlas texture.
+// Returns pixel data (R8), atlas dimensions, and per-miptex rect {x,y,w,h}.
+func buildAtlas(mipTexes []bsp.MipTex, palette []byte) (pixels []byte, atlasW, atlasH int, rects [][4]int32) {
+	atlasW = 2048
+
+	// Build RGB lookup from palette; fall back to greyscale ramp if no palette.
+	palRGB := make([][3]byte, 256)
+	if len(palette) >= 768 {
+		for i := 0; i < 256; i++ {
+			palRGB[i] = [3]byte{palette[i*3], palette[i*3+1], palette[i*3+2]}
+		}
+	} else {
+		for i := range palRGB {
+			v := byte(i)
+			palRGB[i] = [3]byte{v, v, v}
+		}
+	}
+
+	rects = make([][4]int32, len(mipTexes))
+	curX, curY, rowH := 0, 0, 0
+	for i, mt := range mipTexes {
+		if mt.Width == 0 || mt.Height == 0 {
+			continue
+		}
+		if curX+mt.Width > atlasW {
+			curY += rowH
+			curX = 0
+			rowH = 0
+		}
+		if mt.Height > rowH {
+			rowH = mt.Height
+		}
+		rects[i] = [4]int32{int32(curX), int32(curY), int32(mt.Width), int32(mt.Height)}
+		curX += mt.Width
+	}
+	rawH := curY + rowH
+	// Round up to next power of 2
+	atlasH = 1
+	for atlasH < rawH {
+		atlasH <<= 1
+	}
+	if atlasH == 0 {
+		atlasH = 1
+	}
+
+	pixels = make([]byte, atlasW*atlasH*3)
+	for i, mt := range mipTexes {
+		if mt.Width == 0 || mt.Height == 0 || mt.Pixels == nil {
+			continue
+		}
+		rx, ry := int(rects[i][0]), int(rects[i][1])
+		for py := 0; py < mt.Height; py++ {
+			for px := 0; px < mt.Width; px++ {
+				rgb := palRGB[mt.Pixels[py*mt.Width+px]]
+				dst := ((ry+py)*atlasW + (rx + px)) * 3
+				pixels[dst+0] = rgb[0]
+				pixels[dst+1] = rgb[1]
+				pixels[dst+2] = rgb[2]
+			}
+		}
+	}
+	return
+}
+
+// buildFaceAtlasSSBO creates an SSBO (binding 5) with per-face atlas info: vec4{x,y,w,h} in pixels.
+func buildFaceAtlasSSBO(m *bsp.Map, rects [][4]int32) uint32 {
+	data := make([]float32, len(m.Faces)*4)
+	for faceIdx := range m.Faces {
+		face := m.Faces[faceIdx]
+		if int(face.TexInfo) >= len(m.TexInfos) {
+			continue
+		}
+		mipTexIdx := int(m.TexInfos[face.TexInfo].MipTex)
+		if mipTexIdx < 0 || mipTexIdx >= len(rects) {
+			continue
+		}
+		r := rects[mipTexIdx]
+		base := faceIdx * 4
+		data[base+0] = float32(r[0])
+		data[base+1] = float32(r[1])
+		data[base+2] = float32(r[2])
+		data[base+3] = float32(r[3])
+	}
+	var ssbo uint32
+	gl.GenBuffers(1, &ssbo)
+	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, ssbo)
+	gl.BufferData(gl.SHADER_STORAGE_BUFFER, len(data)*4, unsafe.Pointer(&data[0]), gl.STATIC_DRAW)
+	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, 0)
+	return ssbo
 }
 
 // compileRender links vertex + fragment shaders.

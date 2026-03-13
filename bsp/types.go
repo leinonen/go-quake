@@ -85,6 +85,14 @@ type DTexInfo struct {
 	Flags  int32
 }
 
+// MipTex holds a decoded miptex entry (lump 2).
+type MipTex struct {
+	Name   string
+	Width  int
+	Height int
+	Pixels []byte // mip0: Width*Height palette indices; nil if not present
+}
+
 // DModel is a BSP model (world + brush entities).
 type DModel struct {
 	Mins      [3]float32

@@ -42,6 +42,7 @@ func main() {
 	flag.Parse()
 
 	var m *bsp.Map
+	var palette []byte
 
 	switch {
 	case *pakPath != "":
@@ -64,6 +65,9 @@ func main() {
 			}
 			os.Exit(0)
 		}
+
+		// Load palette for texture colour conversion
+		palette, _ = p.ReadFile("gfx/palette.lmp")
 
 		// Normalise: accept "e1m1", "e1m1.bsp", "maps/e1m1.bsp"
 		name := *mapName
@@ -136,7 +140,7 @@ func main() {
 		log.Fatalf("gl init: %v", err)
 	}
 
-	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc)
+	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, palette)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}

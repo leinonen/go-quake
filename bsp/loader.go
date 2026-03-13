@@ -22,7 +22,8 @@ type Map struct {
 	Models       []DModel
 	TexInfos     []DTexInfo
 	LightData    []byte
-	TextureNames []string // indexed by MipTex field of DTexInfo
+	TextureNames []string  // indexed by MipTex field of DTexInfo
+	MipTexes     []MipTex  // indexed by MipTex field of DTexInfo
 }
 
 // Load parses a BSP29 file from disk path.
@@ -154,8 +155,9 @@ func parse(f interface {
 		}
 	}
 
-	// Parse texture names from the MipTex lump (lump 2).
-	// Layout: int32 count, int32 offsets[count], then at each offset: char name[16] ...
+	// Parse miptex entries from lump 2.
+	// Layout: int32 count, int32 offsets[count], then at each offset:
+	//   char name[16], uint32 width, uint32 height, uint32 offsets[4], then pixel data
 	if l := header.Lumps[LumpTextures]; l.Length >= 4 {
 		raw := make([]byte, l.Length)
 		if _, err := f.ReadAt(raw, int64(l.Offset)); err != nil {
@@ -163,22 +165,37 @@ func parse(f interface {
 		}
 		count := int(int32(raw[0]) | int32(raw[1])<<8 | int32(raw[2])<<16 | int32(raw[3])<<24)
 		m.TextureNames = make([]string, count)
+		m.MipTexes = make([]MipTex, count)
 		for i := 0; i < count; i++ {
 			offIdx := 4 + i*4
 			if offIdx+4 > len(raw) {
 				break
 			}
 			off := int(int32(raw[offIdx]) | int32(raw[offIdx+1])<<8 | int32(raw[offIdx+2])<<16 | int32(raw[offIdx+3])<<24)
-			if off < 0 || off+16 > len(raw) {
+			if off < 0 || off+40 > len(raw) {
 				continue
 			}
-			// name is a null-terminated 16-byte field
+			// name[16], width(4), height(4), mip0offset(4), ...
 			name := raw[off : off+16]
 			end := 0
 			for end < 16 && name[end] != 0 {
 				end++
 			}
-			m.TextureNames[i] = string(name[:end])
+			texName := string(name[:end])
+			m.TextureNames[i] = texName
+
+			w := int(uint32(raw[off+16]) | uint32(raw[off+17])<<8 | uint32(raw[off+18])<<16 | uint32(raw[off+19])<<24)
+			h := int(uint32(raw[off+20]) | uint32(raw[off+21])<<8 | uint32(raw[off+22])<<16 | uint32(raw[off+23])<<24)
+			mip0Off := int(uint32(raw[off+24]) | uint32(raw[off+25])<<8 | uint32(raw[off+26])<<16 | uint32(raw[off+27])<<24)
+
+			mt := MipTex{Name: texName, Width: w, Height: h}
+			pixStart := off + mip0Off
+			pixSize := w * h
+			if w > 0 && h > 0 && mip0Off > 0 && pixStart >= 0 && pixStart+pixSize <= len(raw) {
+				mt.Pixels = make([]byte, pixSize)
+				copy(mt.Pixels, raw[pixStart:pixStart+pixSize])
+			}
+			m.MipTexes[i] = mt
 		}
 	}
 

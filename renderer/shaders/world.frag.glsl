@@ -1,6 +1,7 @@
 #version 430 core
 
 flat in uint vFaceIndex;
+in vec2 vTexST;
 
 // SSBO 3: visible face flags (same binding as compute shader)
 layout(std430, binding = 3) readonly buffer VisibleFaces {
@@ -12,8 +13,15 @@ layout(std430, binding = 4) readonly buffer FaceBrightness {
     float faceBrightness[];
 };
 
+// SSBO 5: per-face atlas rect: x, y, w, h in pixels
+layout(std430, binding = 5) readonly buffer FaceAtlasInfo {
+    vec4 faceAtlas[];
+};
+
 uniform bool uUsePVS;
 uniform uint uTotalFaces;
+uniform sampler2D uAtlas;
+uniform vec2 uAtlasSize;
 
 out vec4 fragColor;
 
@@ -23,15 +31,30 @@ void main() {
             discard;
         }
     }
-    float b = (vFaceIndex < uTotalFaces) ? faceBrightness[vFaceIndex] : 1.0;
-    if (b >= 2.5) {
-        // Water: deep blue
-        fragColor = vec4(0.05, 0.2, 0.55, 1.0);
-    } else if (b >= 1.5) {
-        // Sky: light blue
-        fragColor = vec4(0.35, 0.55, 0.85, 1.0);
-    } else {
-        b = pow(b, 0.75); // mild gamma lift — Quake lightmaps are linear, dark on modern displays
-        fragColor = vec4(vec3(b), 1.0);
+
+    // Sample texture from atlas
+    vec3 color = vec3(0.5);
+    if (vFaceIndex < uTotalFaces) {
+        vec4 ar = faceAtlas[vFaceIndex]; // atlasX, atlasY, texW, texH
+        if (ar.z > 0.0 && ar.w > 0.0) {
+            vec2 wrapped = fract(vTexST / ar.zw);
+            vec2 atlasUV = (ar.xy + wrapped * ar.zw) / uAtlasSize;
+            color = texture(uAtlas, atlasUV).rgb;
+        }
     }
+
+    // Slightly desaturate toward grey
+    float luma = dot(color, vec3(0.299, 0.587, 0.114));
+    color = mix(color, vec3(luma), 0.4);
+
+    // Apply lightmap brightness
+    float b = (vFaceIndex < uTotalFaces) ? faceBrightness[vFaceIndex] : 1.0;
+    float lightFactor;
+    if (b >= 1.5) {
+        lightFactor = 1.0; // sky or water: no lightmap dimming
+    } else {
+        lightFactor = pow(b, 0.75); // mild gamma lift for linear lightmaps
+    }
+
+    fragColor = vec4(color * lightFactor, 1.0);
 }

@@ -48,7 +48,7 @@ func Run(m *bsp.Map, bus *game.Bus, spawn mgl32.Vec3) {
 
 func tick(m *bsp.Map, s game.PlayerState, ev game.InputEvent) game.PlayerState {
 	// Mouse look
-	s.Yaw += float32(ev.MouseDX * mouseSens)
+	s.Yaw -= float32(ev.MouseDX * mouseSens)
 	s.Pitch -= float32(ev.MouseDY * mouseSens)
 	if s.Pitch > 89 {
 		s.Pitch = 89

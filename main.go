@@ -17,6 +17,7 @@ import (
 	"go-quake/entities"
 	"go-quake/game"
 	"go-quake/input"
+	"go-quake/mdl"
 	"go-quake/pak"
 	"go-quake/physics"
 	"go-quake/renderer"
@@ -41,6 +42,12 @@ var skyVertSrc string
 //go:embed renderer/shaders/skybox.frag.glsl
 var skyFragSrc string
 
+//go:embed renderer/shaders/weapon.vert.glsl
+var weapVertSrc string
+
+//go:embed renderer/shaders/weapon.frag.glsl
+var weapFragSrc string
+
 const eyeHeight = 22.0
 
 func main() {
@@ -50,6 +57,7 @@ func main() {
 
 	var m *bsp.Map
 	var palette []byte
+	var weapon *renderer.WeaponMesh
 
 	switch {
 	case *pakPath != "":
@@ -75,6 +83,26 @@ func main() {
 
 		// Load palette for texture colour conversion
 		palette, _ = p.ReadFile("gfx/palette.lmp")
+
+		// Load view axe model
+		if axeData, err := p.ReadFile("progs/v_axe.mdl"); err == nil {
+			if axeMDL, err := mdl.Load(axeData); err == nil {
+				verts := axeMDL.BuildVerts(0)
+				texRGB := axeMDL.SkinRGB(0, palette)
+				if len(verts) > 0 && len(texRGB) > 0 {
+					weapon = &renderer.WeaponMesh{
+						Verts:  verts,
+						TexRGB: texRGB,
+						TexW:   axeMDL.SkinWidth,
+						TexH:   axeMDL.SkinHeight,
+					}
+					log.Printf("v_axe.mdl loaded: %d tris, skin %dx%d",
+						len(verts)/15, axeMDL.SkinWidth, axeMDL.SkinHeight)
+				}
+			} else {
+				log.Printf("v_axe.mdl parse: %v", err)
+			}
+		}
 
 		// Normalise: accept "e1m1", "e1m1.bsp", "maps/e1m1.bsp"
 		name := *mapName
@@ -151,7 +179,7 @@ func main() {
 		log.Fatalf("gl init: %v", err)
 	}
 
-	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, palette)
+	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc, palette, weapon)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}

@@ -36,8 +36,10 @@ vis/
   vis.go             — PVS RLE decompress, IsLeafVisible, LeafForPoint
 entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
+mdl/
+  mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts, SkinRGB
 renderer/
-  renderer.go        — GL init, world + entity VAO upload, skybox cube VAO, draw loop
+  renderer.go        — GL init, world + entity VAO upload, skybox cube VAO, weapon VAO, draw loop
   compute.go         — SSBO lifecycle, per-frame dispatch + barrier
   shaders/
     pvs_traverse.glsl  — compute shader: Quake RLE PVS decode on GPU, sets visibleFaceFlags[]
@@ -45,6 +47,8 @@ renderer/
     world.frag.glsl    — per-face texture from atlas; sky faces discard; water faces procedural; discards invisible faces
     skybox.vert.glsl   — passes cube vertex as vDir; sets gl_Position.z = w (depth = 1.0)
     skybox.frag.glsl   — procedural ominous sky: direction-based FBM clouds, horizon ember glow
+    weapon.vert.glsl   — view-space weapon transform: uProj * uWeaponMat * aPos
+    weapon.frag.glsl   — skin texture with grey desaturation + ambient dim to match world look
 physics/
   physics.go         — WASD + mouselook, gravity, jumping, BSP collision; own goroutine
 input/
@@ -109,6 +113,18 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 - Foam-edge highlight where the two wave systems clash (`abs(w1 - w2)`)
 - Animated via `uTime` uniform (elapsed seconds since renderer init)
 
+## view weapon rendering
+
+`progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. Frame 0 (idle) is built into a VAO with interleaved `x,y,z,u,v` (5 floats per vertex, no index buffer).
+
+Draw order: world → brush entities → skybox → **weapon** (depth cleared before weapon draw so it is never occluded by world geometry).
+
+The weapon is positioned in GL camera space via:
+- `RotX(-90) * RotZ(90)` — converts Quake view space (X=forward, -Y=right, Z=up) to GL camera space (-Z=forward, +X=right, +Y=up)
+- `Translate3D(16, -10, -25)` — places it in the lower-right of the view; tune `(right, up, forward)` in camera units
+
+The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mix(color, luma, 0.4)`) plus a fixed 0.72 ambient dim (no BSP lightmap for MDL models). If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
+
 ## special features
 
 - Compute shader PVS: GLQuake's portal/PVS visibility approach executed on the GPU as compute — not rasterization, not raytracing. Unusual middle ground.
@@ -116,6 +132,7 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 - Interactive doors and elevators: proximity-triggered state machines with BSP hull collision.
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
+- View weapon: `v_axe.mdl` rendered in camera space with matching grey aesthetic.
 
 ## current limitations / next steps
 
@@ -123,3 +140,4 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 - No sound
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
 - No monster/item entities
+- Weapon renders frame 0 only — no swing animation, no view bob

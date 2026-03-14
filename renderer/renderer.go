@@ -20,6 +20,14 @@ type entityRenderable struct {
 	numVerts int32
 }
 
+// WeaponMesh contains view-weapon geometry and skin data ready for upload.
+type WeaponMesh struct {
+	Verts  []float32 // interleaved x,y,z,u,v (5 floats per vertex, 3 verts per triangle)
+	TexRGB []byte    // packed RGB pixels
+	TexW   int
+	TexH   int
+}
+
 // Renderer owns all GL state and draws the world.
 type Renderer struct {
 	worldProg   uint32
@@ -47,6 +55,15 @@ type Renderer struct {
 	skyVAO     uint32
 	skyMVPLoc  int32
 	skyTimeLoc int32
+
+	// view weapon
+	weaponProg     uint32
+	weaponVAO      uint32
+	weaponNumVerts int32
+	weaponTex      uint32
+	weapProjLoc    int32
+	weapMatLoc     int32
+	weapTexLoc     int32
 
 	startTime  time.Time
 	entityVAOs []entityRenderable
@@ -77,7 +94,8 @@ var skyboxVerts = [...]float32{
 
 // Init initialises GL state and uploads BSP geometry.
 // palette is 768 bytes (256 RGB triplets) from gfx/palette.lmp; nil uses index-as-grey fallback.
-func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc string, palette []byte) (*Renderer, error) {
+// weapon is optional view-weapon geometry; pass nil to skip weapon rendering.
+func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc string, palette []byte, weapon *WeaponMesh) (*Renderer, error) {
 	prog, err := compileRender(vertSrc, fragSrc)
 	if err != nil {
 		return nil, fmt.Errorf("compile render shaders: %w", err)
@@ -195,6 +213,41 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc strin
 	gl.Enable(gl.CULL_FACE)
 	gl.CullFace(gl.FRONT) // Quake front = clockwise
 
+	// View weapon
+	if weapon != nil && len(weapon.Verts) > 0 && len(weapon.TexRGB) > 0 {
+		wp, err := compileRender(weapVertSrc, weapFragSrc)
+		if err != nil {
+			return nil, fmt.Errorf("compile weapon shaders: %w", err)
+		}
+		r.weaponProg = wp
+		r.weapProjLoc = gl.GetUniformLocation(wp, gl.Str("uProj\x00"))
+		r.weapMatLoc = gl.GetUniformLocation(wp, gl.Str("uWeaponMat\x00"))
+		r.weapTexLoc = gl.GetUniformLocation(wp, gl.Str("uTex\x00"))
+
+		gl.GenVertexArrays(1, &r.weaponVAO)
+		gl.BindVertexArray(r.weaponVAO)
+		var wvbo uint32
+		gl.GenBuffers(1, &wvbo)
+		gl.BindBuffer(gl.ARRAY_BUFFER, wvbo)
+		gl.BufferData(gl.ARRAY_BUFFER, len(weapon.Verts)*4, unsafe.Pointer(&weapon.Verts[0]), gl.STATIC_DRAW)
+		// aPos (location 0): 3 floats, stride 20
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
+		// aTexST (location 1): 2 floats at offset 12
+		gl.EnableVertexAttribArray(1)
+		gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 20, 12)
+		gl.BindVertexArray(0)
+		r.weaponNumVerts = int32(len(weapon.Verts) / 5)
+
+		gl.GenTextures(1, &r.weaponTex)
+		gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(weapon.TexW), int32(weapon.TexH), 0,
+			gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&weapon.TexRGB[0]))
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+		gl.BindTexture(gl.TEXTURE_2D, 0)
+	}
+
 	return r, nil
 }
 
@@ -281,6 +334,41 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.BindVertexArray(0)
 	gl.Enable(gl.CULL_FACE)
 	gl.DepthFunc(gl.LESS)
+
+	// Draw view weapon on top of everything — clear depth so it is never
+	// occluded by world geometry.
+	if r.weaponProg != 0 {
+		gl.Clear(gl.DEPTH_BUFFER_BIT)
+		gl.Disable(gl.CULL_FACE)
+
+		// Position weapon in camera/view space.
+		// Quake MDL view space (yaw=0,pitch=0): X=forward, -Y=right, Z=up.
+		// GL camera space: -Z=forward, +X=right, +Y=up.
+		// Correct transform: RotX(-90) * RotZ(90)
+		//   (RotZ(90) first, then RotX(-90)):
+		//   +X(fwd) → -Z ✓   -Y(right) → +X ✓   +Z(up) → +Y ✓
+		rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
+		rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
+		rot := rotX.Mul4(rotZ)
+		// MDL origin.Z ≈ -24 (axe sits below eye level); after rotation that
+		// becomes -24 in camera Y, so add +24 to keep weapon in frame.
+		trans := mgl32.Translate3D(16, -10, -25)
+		weaponMat := trans.Mul4(rot)
+
+		gl.UseProgram(r.weaponProg)
+		gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
+		gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &weaponMat[0])
+
+		gl.ActiveTexture(gl.TEXTURE0)
+		gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
+		gl.Uniform1i(r.weapTexLoc, 0)
+
+		gl.BindVertexArray(r.weaponVAO)
+		gl.DrawArrays(gl.TRIANGLES, 0, r.weaponNumVerts)
+		gl.BindVertexArray(0)
+
+		gl.Enable(gl.CULL_FACE)
+	}
 }
 
 // CountVisible returns visible face count (debug).

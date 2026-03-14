@@ -23,9 +23,10 @@ type Map struct {
 	Models       []DModel
 	TexInfos     []DTexInfo
 	LightData    []byte
-	TextureNames []string  // indexed by MipTex field of DTexInfo
-	MipTexes     []MipTex  // indexed by MipTex field of DTexInfo
-	Entities     string    // raw entity lump text
+	TextureNames []string   // indexed by MipTex field of DTexInfo
+	MipTexes     []MipTex   // indexed by MipTex field of DTexInfo
+	Entities     string     // raw entity lump text
+	ClipNodes    []DClipNode
 }
 
 // Load parses a BSP29 file from disk path.
@@ -143,6 +144,13 @@ func parse(f interface {
 	} else {
 		m.SurfEdges = make([]int32, len(buf)/4)
 		readStructSlice(buf, m.SurfEdges)
+	}
+
+	if buf, err := readLump(LumpClipNodes, 8); err != nil {
+		return nil, err
+	} else {
+		m.ClipNodes = make([]DClipNode, len(buf)/8)
+		readStructSlice(buf, m.ClipNodes)
 	}
 
 	if buf, err := readLump(LumpModels, 64); err != nil {

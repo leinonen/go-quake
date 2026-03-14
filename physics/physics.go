@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	mouseSens   = 0.15
-	moveSpeed   = 320.0 // units/s, classic Quake speed
-	eyeHeight   = 22.0  // units above floor
+	mouseSens = 0.15
+	moveSpeed = 320.0 // units/s, classic Quake speed
+	eyeHeight = 22.0  // view height above player origin (Quake DEFAULT_VIEWHEIGHT)
+	gravity   = 800.0 // units/s^2
+	jumpSpeed = 270.0 // initial Z velocity on jump
 )
 
 // Run is the physics goroutine. It receives input events and emits player states.
@@ -57,42 +59,135 @@ func tick(m *bsp.Map, s game.PlayerState, ev game.InputEvent) game.PlayerState {
 		s.Pitch = -89
 	}
 
+	dt := float32(ev.Dt)
+	if dt <= 0 {
+		return s
+	}
+
+	// No clip nodes → noclip fallback
+	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
+		return noclip(m, s, ev, dt)
+	}
+
+	hull := m.Models[0].HeadNodes[1] // standing player hull
+
+	// Player origin = eye position minus view height
+	origin := [3]float32{s.Position[0], s.Position[1], s.Position[2] - eyeHeight}
+
 	yaw := float64(mgl32.DegToRad(s.Yaw))
-	forward := [3]float32{
-		float32(math.Cos(yaw)),
-		float32(math.Sin(yaw)),
-		0,
-	}
-	right := [3]float32{
-		float32(math.Sin(yaw)),
-		float32(-math.Cos(yaw)),
-		0,
-	}
+	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
+	right := [3]float32{float32(math.Sin(yaw)), float32(-math.Cos(yaw)), 0}
 
-	speed := float32(moveSpeed * ev.Dt)
-	move := mgl32.Vec3{}
-
+	// Desired horizontal velocity from WASD
+	var wishX, wishY float32
+	spd := float32(moveSpeed)
 	if ev.Keys[glfw.KeyW] || ev.Keys[glfw.KeyUp] {
-		move = move.Add(mgl32.Vec3(forward).Mul(speed))
+		wishX += fwd[0] * spd
+		wishY += fwd[1] * spd
 	}
 	if ev.Keys[glfw.KeyS] || ev.Keys[glfw.KeyDown] {
-		move = move.Sub(mgl32.Vec3(forward).Mul(speed))
+		wishX -= fwd[0] * spd
+		wishY -= fwd[1] * spd
 	}
 	if ev.Keys[glfw.KeyA] {
-		move = move.Sub(mgl32.Vec3(right).Mul(speed))
+		wishX -= right[0] * spd
+		wishY -= right[1] * spd
 	}
 	if ev.Keys[glfw.KeyD] {
-		move = move.Add(mgl32.Vec3(right).Mul(speed))
+		wishX += right[0] * spd
+		wishY += right[1] * spd
 	}
-	if ev.Keys[glfw.KeySpace] {
-		move[2] += speed
-	}
-	if ev.Keys[glfw.KeyLeftControl] || ev.Keys[glfw.KeyC] {
-		move[2] -= speed
+	// Override horizontal velocity — no momentum in Quake walking
+	s.Velocity[0] = wishX
+	s.Velocity[1] = wishY
+
+	// Apply gravity when airborne
+	if !s.OnGround {
+		s.Velocity[2] -= gravity * dt
 	}
 
-	s.Position = s.Position.Add(move)
+	// Jump
+	if ev.Keys[glfw.KeySpace] && s.OnGround {
+		s.Velocity[2] = jumpSpeed
+		s.OnGround = false
+	}
+
+	// Slide move
+	disp := [3]float32{s.Velocity[0] * dt, s.Velocity[1] * dt, s.Velocity[2] * dt}
+	newOrigin := slideMove(m.ClipNodes, m.Planes, hull, origin, disp)
+
+	// Ground check: trace 2 units down from new position
+	groundEnd := [3]float32{newOrigin[0], newOrigin[1], newOrigin[2] - 2}
+	gtr := bsp.HullTrace(m.ClipNodes, m.Planes, hull, newOrigin, groundEnd)
+	if gtr.Hit && gtr.Normal[2] > 0.7 {
+		s.OnGround = true
+		s.Velocity[2] = 0
+		newOrigin = gtr.EndPos
+	} else {
+		s.OnGround = false
+	}
+
+	s.Position = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
 	s.LeafIndex = vis.LeafForPoint(m, [3]float32(s.Position))
 
+	return s
+}
+
+// slideMove moves origin by disp, sliding along surfaces on impact (2-pass).
+func slideMove(clipNodes []bsp.DClipNode, planes []bsp.DPlane, hull int32, origin, disp [3]float32) [3]float32 {
+	end := [3]float32{origin[0] + disp[0], origin[1] + disp[1], origin[2] + disp[2]}
+	tr := bsp.HullTrace(clipNodes, planes, hull, origin, end)
+	if !tr.Hit {
+		return end
+	}
+	if tr.StartSolid {
+		return origin // stuck in solid, don't move
+	}
+
+	// Clip remaining displacement along the hit normal.
+	rem := 1 - tr.Fraction
+	d := disp[0]*tr.Normal[0] + disp[1]*tr.Normal[1] + disp[2]*tr.Normal[2]
+	slide := [3]float32{
+		(disp[0] - tr.Normal[0]*d) * rem,
+		(disp[1] - tr.Normal[1]*d) * rem,
+		(disp[2] - tr.Normal[2]*d) * rem,
+	}
+
+	// Second pass along the slide direction.
+	end2 := [3]float32{tr.EndPos[0] + slide[0], tr.EndPos[1] + slide[1], tr.EndPos[2] + slide[2]}
+	tr2 := bsp.HullTrace(clipNodes, planes, hull, tr.EndPos, end2)
+	if !tr2.Hit {
+		return end2
+	}
+	return tr2.EndPos
+}
+
+// noclip is the fallback movement when no clip hull is available.
+func noclip(m *bsp.Map, s game.PlayerState, ev game.InputEvent, dt float32) game.PlayerState {
+	yaw := float64(mgl32.DegToRad(s.Yaw))
+	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
+	right := [3]float32{float32(math.Sin(yaw)), float32(-math.Cos(yaw)), 0}
+	spd := moveSpeed * dt
+	move := mgl32.Vec3{}
+	if ev.Keys[glfw.KeyW] || ev.Keys[glfw.KeyUp] {
+		move = move.Add(mgl32.Vec3(fwd).Mul(spd))
+	}
+	if ev.Keys[glfw.KeyS] || ev.Keys[glfw.KeyDown] {
+		move = move.Sub(mgl32.Vec3(fwd).Mul(spd))
+	}
+	if ev.Keys[glfw.KeyA] {
+		move = move.Sub(mgl32.Vec3(right).Mul(spd))
+	}
+	if ev.Keys[glfw.KeyD] {
+		move = move.Add(mgl32.Vec3(right).Mul(spd))
+	}
+	if ev.Keys[glfw.KeySpace] {
+		move[2] += spd
+	}
+	if ev.Keys[glfw.KeyLeftControl] || ev.Keys[glfw.KeyC] {
+		move[2] -= spd
+	}
+	s.Position = s.Position.Add(move)
+	s.LeafIndex = vis.LeafForPoint(m, [3]float32(s.Position))
 	return s
 }

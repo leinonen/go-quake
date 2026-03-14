@@ -93,6 +93,22 @@ type MipTex struct {
 	Pixels []byte // mip0: Width*Height palette indices; nil if not present
 }
 
+// DClipNode is a collision BSP node (lump 9, 8 bytes).
+type DClipNode struct {
+	PlaneNum int32
+	Children [2]int16 // positive = clip node index, negative = leaf contents
+}
+
+// Leaf contents values returned from hull traversal.
+const (
+	ContentsEmpty = -1
+	ContentsSolid = -2
+	ContentsWater = -3
+	ContentsSlime = -4
+	ContentsLava  = -5
+	ContentsSky   = -6
+)
+
 // DModel is a BSP model (world + brush entities).
 type DModel struct {
 	Mins      [3]float32

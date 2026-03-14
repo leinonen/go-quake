@@ -11,9 +11,11 @@ type InputEvent struct {
 
 // PlayerState is the authoritative player position/orientation sent from physics to coordinator.
 type PlayerState struct {
-	Position  mgl32.Vec3
+	Position   mgl32.Vec3
+	Velocity   mgl32.Vec3
 	Yaw, Pitch float32
 	LeafIndex  int
+	OnGround   bool
 }
 
 // RenderFrame is sent from coordinator to renderer each frame.

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -119,4 +121,65 @@ func entryName(e entry) string {
 		n = n[:i]
 	}
 	return string(n)
+}
+
+// MultiPAK searches multiple PAK files in reverse order so later paks override earlier ones.
+type MultiPAK struct {
+	paks []*PAK
+}
+
+// OpenDir opens all pak*.pak files found in dir, sorted so pak1 overrides pak0.
+func OpenDir(dir string) (*MultiPAK, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, "pak*.pak"))
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(matches)
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no pak*.pak files found in %s", dir)
+	}
+	m := &MultiPAK{}
+	for _, path := range matches {
+		p, err := Open(path)
+		if err != nil {
+			m.Close()
+			return nil, fmt.Errorf("open %s: %w", path, err)
+		}
+		m.paks = append(m.paks, p)
+	}
+	return m, nil
+}
+
+// Close closes all PAK files.
+func (m *MultiPAK) Close() {
+	for _, p := range m.paks {
+		p.Close()
+	}
+}
+
+// ReadFile returns the contents of the named file, searching later paks first.
+func (m *MultiPAK) ReadFile(name string) ([]byte, error) {
+	for i := len(m.paks) - 1; i >= 0; i-- {
+		if data, err := m.paks[i].ReadFile(name); err == nil {
+			return data, nil
+		}
+	}
+	return nil, fmt.Errorf("%q not found in any PAK", name)
+}
+
+// FindMaps returns all .bsp paths across all paks, with later paks taking precedence.
+func (m *MultiPAK) FindMaps() []string {
+	seen := map[string]bool{}
+	var maps []string
+	for i := len(m.paks) - 1; i >= 0; i-- {
+		for _, name := range m.paks[i].FindMaps() {
+			lower := strings.ToLower(name)
+			if !seen[lower] {
+				seen[lower] = true
+				maps = append(maps, name)
+			}
+		}
+	}
+	sort.Strings(maps)
+	return maps
 }

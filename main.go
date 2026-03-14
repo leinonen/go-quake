@@ -54,20 +54,22 @@ var weapFragSrc string
 const eyeHeight = 22.0
 
 func main() {
-	pakPath := flag.String("pak", "", "path to PAK file (e.g. pak0.pak)")
-	mapName := flag.String("map", "", "map name inside PAK (e.g. e1m1) or path to .bsp file")
+	pakPath := flag.String("pak", "", "path to id1 directory containing pak*.pak files")
+	mapName := flag.String("map", "", "map name (e.g. e1m1) or path to .bsp file")
 	flag.Parse()
 
 	var m *bsp.Map
 	var palette []byte
 	var weapon *renderer.WeaponMesh
+	var itemMeshes [][]*renderer.WeaponMesh
+	var itemStates []game.ItemState
 
 	switch {
 	case *pakPath != "":
-		// Load from PAK
-		p, err := pak.Open(*pakPath)
+		// Load all pak*.pak files from the given directory
+		p, err := pak.OpenDir(*pakPath)
 		if err != nil {
-			log.Fatalf("open pak: %v", err)
+			log.Fatalf("open pak dir: %v", err)
 		}
 		defer p.Close()
 
@@ -125,6 +127,62 @@ func main() {
 			log.Fatalf("parse bsp: %v", err)
 		}
 
+		// Load item models (MDL or BSP sub-model) referenced by the map entity lump.
+		itemSpawns := entities.ParseItems(m.Entities)
+		modelPathToIdx := map[string]int{}
+		for _, sp := range itemSpawns {
+			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
+				modelPathToIdx[sp.ModelPath] = len(itemMeshes)
+				var groups []*renderer.WeaponMesh
+				if idata, ierr := p.ReadFile(sp.ModelPath); ierr == nil {
+					if strings.HasSuffix(sp.ModelPath, ".mdl") {
+						if imdl, merr := mdl.Load(idata); merr == nil {
+							verts := imdl.BuildVerts(0)
+							texRGB := imdl.SkinRGB(0, palette)
+							if len(verts) > 0 && len(texRGB) > 0 {
+								groups = []*renderer.WeaponMesh{{
+									Verts:  verts,
+									TexRGB: texRGB,
+									TexW:   imdl.SkinWidth,
+									TexH:   imdl.SkinHeight,
+								}}
+								log.Printf("item MDL loaded:  %s (%d tris)", sp.ModelPath, len(verts)/15)
+							}
+						} else {
+							log.Printf("item MDL parse failed: %s: %v", sp.ModelPath, merr)
+						}
+					} else if strings.HasSuffix(sp.ModelPath, ".bsp") {
+						var merr error
+						groups, merr = renderer.BuildBSPItemMesh(idata, palette)
+						if merr != nil {
+							log.Printf("item BSP parse failed: %s: %v", sp.ModelPath, merr)
+						} else {
+							total := 0
+							for _, g := range groups {
+								total += len(g.Verts) / 15
+							}
+							log.Printf("item BSP loaded:  %s (%d tris, %d textures)", sp.ModelPath, total, len(groups))
+						}
+					}
+				} else {
+					log.Printf("item model not in PAK: %s", sp.ModelPath)
+				}
+				itemMeshes = append(itemMeshes, groups)
+			}
+			itemStates = append(itemStates, game.ItemState{
+				Pos:    sp.Pos,
+				MdlIdx: modelPathToIdx[sp.ModelPath],
+			})
+		}
+		// Warn about item-like classnames we have no mapping for
+		for _, e := range bsp.ParseEntities(m.Entities) {
+			class := e.Fields["classname"]
+			if (strings.HasPrefix(class, "item_") || strings.HasPrefix(class, "weapon_") || strings.HasPrefix(class, "ammo_")) && entities.ItemPath(e) == "" {
+				log.Printf("item classname not mapped: %s", class)
+			}
+		}
+		log.Printf("items: %d spawns, %d unique models", len(itemStates), len(itemMeshes))
+
 	case *mapName != "":
 		// Direct .bsp file
 		var err error
@@ -135,8 +193,8 @@ func main() {
 
 	default:
 		fmt.Fprintln(os.Stderr, "usage:")
-		fmt.Fprintln(os.Stderr, "  go-quake -pak pak0.pak -map e1m1")
-		fmt.Fprintln(os.Stderr, "  go-quake -pak pak0.pak          (list maps)")
+		fmt.Fprintln(os.Stderr, "  go-quake -pak /path/to/id1 -map e1m1")
+		fmt.Fprintln(os.Stderr, "  go-quake -pak /path/to/id1          (list maps)")
 		fmt.Fprintln(os.Stderr, "  go-quake -map /path/to/map.bsp")
 		os.Exit(1)
 	}
@@ -182,7 +240,7 @@ func main() {
 		log.Fatalf("gl init: %v", err)
 	}
 
-	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc, palette, weapon)
+	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc, palette, weapon, itemMeshes)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}
@@ -242,7 +300,7 @@ func main() {
 		w, h := win.GetFramebufferSize()
 		gl.Viewport(0, 0, int32(w), int32(h))
 
-		rend.Draw(game.RenderFrame{Player: playerState}, w, h)
+		rend.Draw(game.RenderFrame{Player: playerState, Items: itemStates}, w, h)
 
 		if screenshotRequested {
 			screenshotRequested = false

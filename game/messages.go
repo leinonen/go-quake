@@ -25,8 +25,15 @@ type PlayerState struct {
 	Entities   []EntityState
 }
 
+// ItemState carries the world position and mesh index for one item pickup.
+type ItemState struct {
+	Pos    [3]float32
+	MdlIdx int
+}
+
 // RenderFrame is sent from coordinator to renderer each frame.
 type RenderFrame struct {
 	Player    PlayerState
+	Items     []ItemState
 	FrameTime float64
 }

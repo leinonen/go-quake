@@ -20,6 +20,18 @@ type entityRenderable struct {
 	numVerts int32
 }
 
+// itemGroup holds one VAO+texture pair for a single texture within an item model.
+type itemGroup struct {
+	vao      uint32
+	numVerts int32
+	tex      uint32
+}
+
+// itemRenderable holds all texture groups for one unique item model.
+type itemRenderable struct {
+	groups []itemGroup
+}
+
 // WeaponMesh contains view-weapon geometry and skin data ready for upload.
 type WeaponMesh struct {
 	Verts  []float32 // interleaved x,y,z,u,v (5 floats per vertex, 3 verts per triangle)
@@ -67,6 +79,7 @@ type Renderer struct {
 
 	startTime  time.Time
 	entityVAOs []entityRenderable
+	itemVAOs   []itemRenderable
 }
 
 // skyboxVerts is a unit cube (36 vertices, Z-up) used as the skybox mesh.
@@ -95,7 +108,9 @@ var skyboxVerts = [...]float32{
 // Init initialises GL state and uploads BSP geometry.
 // palette is 768 bytes (256 RGB triplets) from gfx/palette.lmp; nil uses index-as-grey fallback.
 // weapon is optional view-weapon geometry; pass nil to skip weapon rendering.
-func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc string, palette []byte, weapon *WeaponMesh) (*Renderer, error) {
+// items is a slice of per-unique-model mesh groups for world item pickups; may be nil.
+// Each inner slice holds one WeaponMesh per texture group (MDL = 1 group, BSP = N groups).
+func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc string, palette []byte, weapon *WeaponMesh, items [][]*WeaponMesh) (*Renderer, error) {
 	prog, err := compileRender(vertSrc, fragSrc)
 	if err != nil {
 		return nil, fmt.Errorf("compile render shaders: %w", err)
@@ -248,6 +263,47 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weap
 		gl.BindTexture(gl.TEXTURE_2D, 0)
 	}
 
+	// Upload item model VAOs — each model is a slice of texture groups (x,y,z,u,v format).
+	// MDL items have one group; BSP items have one group per unique texture.
+	for _, groups := range items {
+		var ir itemRenderable
+		for _, g := range groups {
+			if g == nil || len(g.Verts) == 0 || len(g.TexRGB) == 0 {
+				continue
+			}
+			var ivao, ivbo uint32
+			gl.GenVertexArrays(1, &ivao)
+			gl.BindVertexArray(ivao)
+			gl.GenBuffers(1, &ivbo)
+			gl.BindBuffer(gl.ARRAY_BUFFER, ivbo)
+			gl.BufferData(gl.ARRAY_BUFFER, len(g.Verts)*4, unsafe.Pointer(&g.Verts[0]), gl.STATIC_DRAW)
+			gl.EnableVertexAttribArray(0)
+			gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
+			gl.EnableVertexAttribArray(1)
+			gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 20, 12)
+			gl.BindVertexArray(0)
+
+			var itex uint32
+			gl.GenTextures(1, &itex)
+			gl.BindTexture(gl.TEXTURE_2D, itex)
+			gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(g.TexW), int32(g.TexH), 0,
+				gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&g.TexRGB[0]))
+			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+			// GL_REPEAT so BSP item UV (s/texW, t/texH) tiles correctly when > 1
+			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT)
+			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT)
+			gl.BindTexture(gl.TEXTURE_2D, 0)
+
+			ir.groups = append(ir.groups, itemGroup{
+				vao:      ivao,
+				numVerts: int32(len(g.Verts) / 5),
+				tex:      itex,
+			})
+		}
+		r.itemVAOs = append(r.itemVAOs, ir)
+	}
+
 	return r, nil
 }
 
@@ -316,6 +372,34 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 			gl.BindVertexArray(0)
 		}
 		gl.Uniform1i(r.usePVSLoc, boolToInt32(r.usePVS))
+	}
+
+	// Draw world items — MDL/BSP models at their BSP entity origins, occluded by world geometry.
+	if r.weaponProg != 0 && len(frame.Items) > 0 {
+		gl.Disable(gl.CULL_FACE)
+		gl.UseProgram(r.weaponProg)
+		gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
+		gl.Uniform1i(r.weapTexLoc, 0)
+		gl.ActiveTexture(gl.TEXTURE0)
+		for _, is := range frame.Items {
+			if is.MdlIdx < 0 || is.MdlIdx >= len(r.itemVAOs) {
+				continue
+			}
+			ir := r.itemVAOs[is.MdlIdx]
+			if len(ir.groups) == 0 {
+				continue
+			}
+			itemMat := view.Mul4(mgl32.Translate3D(is.Pos[0], is.Pos[1], is.Pos[2]))
+			gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &itemMat[0])
+			for _, g := range ir.groups {
+				gl.BindTexture(gl.TEXTURE_2D, g.tex)
+				gl.BindVertexArray(g.vao)
+				gl.DrawArrays(gl.TRIANGLES, 0, g.numVerts)
+			}
+		}
+		gl.BindVertexArray(0)
+		gl.BindTexture(gl.TEXTURE_2D, 0)
+		gl.Enable(gl.CULL_FACE)
 	}
 
 	// Draw skybox last — rotation-only view so it's infinitely far away.
@@ -496,6 +580,98 @@ func buildAtlas(mipTexes []bsp.MipTex, palette []byte) (pixels []byte, atlasW, a
 		}
 	}
 	return
+}
+
+// BuildBSPItemMesh converts a small BSP sub-model file into per-texture WeaponMesh groups.
+// UV is stored as s/texW, t/texH (normalized, may tile > 1 — upload textures with GL_REPEAT).
+func BuildBSPItemMesh(data []byte, palette []byte) ([]*WeaponMesh, error) {
+	m, err := bsp.LoadBytes(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(m.Models) == 0 {
+		return nil, fmt.Errorf("no models in item BSP")
+	}
+
+	palRGB := make([][3]byte, 256)
+	if len(palette) >= 768 {
+		for i := 0; i < 256; i++ {
+			palRGB[i] = [3]byte{palette[i*3], palette[i*3+1], palette[i*3+2]}
+		}
+	} else {
+		for i := range palRGB {
+			v := byte(i)
+			palRGB[i] = [3]byte{v, v, v}
+		}
+	}
+
+	model := m.Models[0]
+	firstFace := int(model.FirstFace)
+	lastFace := firstFace + int(model.NumFaces)
+
+	// Collect vertices per miptex index
+	texVerts := map[int][]float32{}
+	for faceIdx := firstFace; faceIdx < lastFace; faceIdx++ {
+		face := m.Faces[faceIdx]
+		if int(face.TexInfo) >= len(m.TexInfos) {
+			continue
+		}
+		ti := m.TexInfos[face.TexInfo]
+		mipIdx := int(ti.MipTex)
+		if mipIdx < 0 || mipIdx >= len(m.MipTexes) {
+			continue
+		}
+		mt := m.MipTexes[mipIdx]
+		if mt.Width == 0 || mt.Height == 0 || mt.Pixels == nil {
+			continue
+		}
+		sv, tv := ti.Vecs[0], ti.Vecs[1]
+
+		faceVs := make([][3]float32, 0, face.NumEdges)
+		for i := 0; i < int(face.NumEdges); i++ {
+			seIdx := int(face.FirstEdge) + i
+			se := m.SurfEdges[seIdx]
+			var v [3]float32
+			if se >= 0 {
+				v = m.Vertices[m.Edges[se].V[0]]
+			} else {
+				v = m.Vertices[m.Edges[-se].V[1]]
+			}
+			faceVs = append(faceVs, v)
+		}
+		for i := 1; i+1 < len(faceVs); i++ {
+			for _, vtx := range [][3]float32{faceVs[0], faceVs[i], faceVs[i+1]} {
+				s := vtx[0]*sv[0] + vtx[1]*sv[1] + vtx[2]*sv[2] + sv[3]
+				t := vtx[0]*tv[0] + vtx[1]*tv[1] + vtx[2]*tv[2] + tv[3]
+				u := s / float32(mt.Width)
+				v := t / float32(mt.Height)
+				texVerts[mipIdx] = append(texVerts[mipIdx], vtx[0], vtx[1], vtx[2], u, v)
+			}
+		}
+	}
+
+	if len(texVerts) == 0 {
+		return nil, fmt.Errorf("no geometry in item BSP")
+	}
+
+	var groups []*WeaponMesh
+	for mipIdx, verts := range texVerts {
+		mt := m.MipTexes[mipIdx]
+		texRGB := make([]byte, len(mt.Pixels)*3)
+		for i, idx := range mt.Pixels {
+			rgb := palRGB[idx]
+			texRGB[i*3+0] = rgb[0]
+			texRGB[i*3+1] = rgb[1]
+			texRGB[i*3+2] = rgb[2]
+		}
+		groups = append(groups, &WeaponMesh{
+			Verts:  verts,
+			TexRGB: texRGB,
+			TexW:   mt.Width,
+			TexH:   mt.Height,
+		})
+	}
+	return groups, nil
 }
 
 // buildFaceAtlasSSBO creates an SSBO (binding 5) with per-face atlas info: vec4{x,y,w,h} in pixels.

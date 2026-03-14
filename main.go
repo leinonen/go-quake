@@ -35,6 +35,12 @@ var vertSrc string
 //go:embed renderer/shaders/world.frag.glsl
 var fragSrc string
 
+//go:embed renderer/shaders/skybox.vert.glsl
+var skyVertSrc string
+
+//go:embed renderer/shaders/skybox.frag.glsl
+var skyFragSrc string
+
 const eyeHeight = 22.0
 
 func main() {
@@ -145,7 +151,7 @@ func main() {
 		log.Fatalf("gl init: %v", err)
 	}
 
-	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, palette)
+	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, palette)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}

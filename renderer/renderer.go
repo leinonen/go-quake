@@ -3,6 +3,7 @@ package renderer
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unsafe"
 
 	"math"
@@ -40,13 +41,43 @@ type Renderer struct {
 	atlasLoc          int32
 	atlasSizeLoc      int32
 	entityOffsetLoc   int32
+	timeLoc           int32
 
+	skyProg    uint32
+	skyVAO     uint32
+	skyMVPLoc  int32
+	skyTimeLoc int32
+
+	startTime  time.Time
 	entityVAOs []entityRenderable
+}
+
+// skyboxVerts is a unit cube (36 vertices, Z-up) used as the skybox mesh.
+// Face culling is disabled during the skybox draw, so winding order doesn't matter.
+var skyboxVerts = [...]float32{
+	// Bottom (Z = -1)
+	-1, -1, -1, 1, -1, -1, 1, 1, -1,
+	1, 1, -1, -1, 1, -1, -1, -1, -1,
+	// Top (Z = +1)
+	-1, -1, 1, -1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, -1, 1, -1, -1, 1,
+	// Front (Y = -1)
+	-1, -1, -1, -1, -1, 1, 1, -1, 1,
+	1, -1, 1, 1, -1, -1, -1, -1, -1,
+	// Back (Y = +1)
+	1, 1, -1, 1, 1, 1, -1, 1, 1,
+	-1, 1, 1, -1, 1, -1, 1, 1, -1,
+	// Left (X = -1)
+	-1, 1, -1, -1, 1, 1, -1, -1, 1,
+	-1, -1, 1, -1, -1, -1, -1, 1, -1,
+	// Right (X = +1)
+	1, -1, -1, 1, -1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, -1, 1, -1, -1,
 }
 
 // Init initialises GL state and uploads BSP geometry.
 // palette is 768 bytes (256 RGB triplets) from gfx/palette.lmp; nil uses index-as-grey fallback.
-func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string, palette []byte) (*Renderer, error) {
+func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc string, palette []byte) (*Renderer, error) {
 	prog, err := compileRender(vertSrc, fragSrc)
 	if err != nil {
 		return nil, fmt.Errorf("compile render shaders: %w", err)
@@ -63,6 +94,28 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string, palette []byte) (*Ren
 	r.atlasLoc = gl.GetUniformLocation(prog, gl.Str("uAtlas\x00"))
 	r.atlasSizeLoc = gl.GetUniformLocation(prog, gl.Str("uAtlasSize\x00"))
 	r.entityOffsetLoc = gl.GetUniformLocation(prog, gl.Str("uEntityOffset\x00"))
+	r.timeLoc = gl.GetUniformLocation(prog, gl.Str("uTime\x00"))
+	r.startTime = time.Now()
+
+	// Skybox shader
+	skyProg, err := compileRender(skyVertSrc, skyFragSrc)
+	if err != nil {
+		return nil, fmt.Errorf("compile skybox shaders: %w", err)
+	}
+	r.skyProg = skyProg
+	r.skyMVPLoc = gl.GetUniformLocation(skyProg, gl.Str("uMVP\x00"))
+	r.skyTimeLoc = gl.GetUniformLocation(skyProg, gl.Str("uTime\x00"))
+
+	// Skybox cube VAO
+	gl.GenVertexArrays(1, &r.skyVAO)
+	gl.BindVertexArray(r.skyVAO)
+	var skyVBO uint32
+	gl.GenBuffers(1, &skyVBO)
+	gl.BindBuffer(gl.ARRAY_BUFFER, skyVBO)
+	gl.BufferData(gl.ARRAY_BUFFER, len(skyboxVerts)*4, unsafe.Pointer(&skyboxVerts[0]), gl.STATIC_DRAW)
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 12, 0)
+	gl.BindVertexArray(0)
 
 	// Build texture atlas
 	atlasPixels, aw, ah, rects := buildAtlas(m.MipTexes, palette)
@@ -175,6 +228,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.UniformMatrix4fv(r.mvpLoc, 1, false, &mvp[0])
 	gl.Uniform1i(r.usePVSLoc, boolToInt32(r.usePVS))
 	gl.Uniform1ui(r.totalFaceLoc, r.numFaces)
+	gl.Uniform1f(r.timeLoc, float32(time.Since(r.startTime).Seconds()))
 
 	r.compute.BindVisFlags()
 	gl.BindBufferBase(gl.SHADER_STORAGE_BUFFER, 4, r.ssboBrightness)
@@ -210,6 +264,23 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 		}
 		gl.Uniform1i(r.usePVSLoc, boolToInt32(r.usePVS))
 	}
+
+	// Draw skybox last — rotation-only view so it's infinitely far away.
+	// gl_Position.z = gl_Position.w in the vert shader sets depth = 1.0,
+	// so DepthFunc(LEQUAL) lets it pass only where nothing closer was drawn
+	// (i.e. the holes left by discarded sky faces).
+	skyView := mgl32.LookAtV(mgl32.Vec3{0, 0, 0}, forward, up)
+	skyMVP := proj.Mul4(skyView)
+	gl.DepthFunc(gl.LEQUAL)
+	gl.Disable(gl.CULL_FACE)
+	gl.UseProgram(r.skyProg)
+	gl.UniformMatrix4fv(r.skyMVPLoc, 1, false, &skyMVP[0])
+	gl.Uniform1f(r.skyTimeLoc, float32(time.Since(r.startTime).Seconds()))
+	gl.BindVertexArray(r.skyVAO)
+	gl.DrawArrays(gl.TRIANGLES, 0, 36)
+	gl.BindVertexArray(0)
+	gl.Enable(gl.CULL_FACE)
+	gl.DepthFunc(gl.LESS)
 }
 
 // CountVisible returns visible face count (debug).

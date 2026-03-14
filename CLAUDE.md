@@ -37,12 +37,14 @@ vis/
 entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
 renderer/
-  renderer.go        — GL init, world + entity VAO upload, draw loop
+  renderer.go        — GL init, world + entity VAO upload, skybox cube VAO, draw loop
   compute.go         — SSBO lifecycle, per-frame dispatch + barrier
   shaders/
     pvs_traverse.glsl  — compute shader: Quake RLE PVS decode on GPU, sets visibleFaceFlags[]
     world.vert.glsl    — perspective projection + uEntityOffset for brush entity rendering
-    world.frag.glsl    — per-face texture from atlas, discards if visibleFaceFlags[face] == 0
+    world.frag.glsl    — per-face texture from atlas; sky faces discard; water faces procedural; discards invisible faces
+    skybox.vert.glsl   — passes cube vertex as vDir; sets gl_Position.z = w (depth = 1.0)
+    skybox.frag.glsl   — procedural ominous sky: direction-based FBM clouds, horizon ember glow
 physics/
   physics.go         — WASD + mouselook, gravity, jumping, BSP collision; own goroutine
 input/
@@ -83,11 +85,37 @@ State machine per entity: `Closed → Opening → Open → Closing → Closed`.
 - **Collision:** `traceAll` in physics traces world hull + each entity's `HeadNodes[1]` hull (offset into entity local space); player cannot walk through closed/moving doors
 - **Rendering:** per-entity VAO built at init from `Models[N]` faces; `uEntityOffset` uniform shifts vertices each frame
 
+## skybox rendering
+
+Sky polygon faces (BSP texture prefix `sky`, brightness sentinel 2.0) are discarded in `world.frag.glsl`, punching holes in the depth buffer (depth stays at clear value 1.0).
+
+The skybox is drawn last:
+- Rotation-only view matrix (translation stripped) so it appears infinitely far
+- `gl_Position.z = gl_Position.w` in vertex shader → fragment depth always = 1.0
+- `glDepthFunc(GL_LEQUAL)` → skybox only fills pixels where nothing closer was drawn (i.e. the sky holes)
+- Face culling disabled for the draw call; restored afterward
+
+Skybox fragment shader uses `vDir = aPos` (cube vertex interpolated as world-space direction):
+- `dir.z` = elevation (Quake Z-up); drives horizon fade and above/below split
+- Sky-plane projection `dir.xy / max(dir.z, 0.05)` makes clouds recede toward the horizon
+- Three FBM layers: slow void, rolling crimson masses, fast ember-orange/magenta veins
+- Ember glow band at `elev ≈ 0`, void below horizon
+
+## procedural water
+
+Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas and are shaded procedurally in `world.frag.glsl`:
+- Two FBM layers sampled through sin-warp distorted UVs (Quake-style turbulence)
+- Dark murky teal base with sparse caustic glints at wave crests
+- Foam-edge highlight where the two wave systems clash (`abs(w1 - w2)`)
+- Animated via `uTime` uniform (elapsed seconds since renderer init)
+
 ## special features
 
 - Compute shader PVS: GLQuake's portal/PVS visibility approach executed on the GPU as compute — not rasterization, not raytracing. Unusual middle ground.
 - Emergent game loop: no central tick. Input, physics, and rendering are goroutines communicating via typed channels. Vsync (`SwapInterval(1)`) is the only throttle.
 - Interactive doors and elevators: proximity-triggered state machines with BSP hull collision.
+- Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
+- Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
 
 ## current limitations / next steps
 

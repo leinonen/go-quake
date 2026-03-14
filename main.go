@@ -106,15 +106,19 @@ func main() {
 	log.Printf("BSP loaded: %d leaves, %d nodes, %d faces, %d vertices",
 		len(m.Leaves), len(m.Nodes), len(m.Faces), len(m.Vertices))
 
-	// Spawn position: e1m1 default, or centre of world model AABB
-	spawn := mgl32.Vec3{480, -352, 88}
-	if len(m.Models) > 0 {
+	// Spawn position: parse info_player_start from entities, fall back to AABB centre.
+	var spawn mgl32.Vec3
+	if org, ok := m.SpawnPoint(); ok {
+		spawn = mgl32.Vec3{org[0], org[1], org[2] + eyeHeight}
+		log.Printf("spawn from info_player_start: %.0f %.0f %.0f", org[0], org[1], org[2])
+	} else if len(m.Models) > 0 {
 		mo := m.Models[0]
 		spawn = mgl32.Vec3{
 			(mo.Mins[0] + mo.Maxs[0]) / 2,
 			(mo.Mins[1] + mo.Maxs[1]) / 2,
 			mo.Mins[2] + eyeHeight,
 		}
+		log.Printf("spawn fallback to AABB centre: %.0f %.0f %.0f", spawn[0], spawn[1], spawn[2])
 	}
 
 	// GLFW + GL

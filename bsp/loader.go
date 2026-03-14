@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 // Map holds all parsed BSP data.
@@ -24,6 +25,7 @@ type Map struct {
 	LightData    []byte
 	TextureNames []string  // indexed by MipTex field of DTexInfo
 	MipTexes     []MipTex  // indexed by MipTex field of DTexInfo
+	Entities     string    // raw entity lump text
 }
 
 // Load parses a BSP29 file from disk path.
@@ -70,6 +72,15 @@ func parse(f interface {
 	}
 
 	m := &Map{}
+
+	if l := header.Lumps[LumpEntities]; l.Length > 0 {
+		buf := make([]byte, l.Length)
+		if _, err := f.ReadAt(buf, int64(l.Offset)); err != nil {
+			return nil, fmt.Errorf("read entities: %w", err)
+		}
+		// Strip trailing null byte if present.
+		m.Entities = string(bytes.TrimRight(buf, "\x00"))
+	}
 
 	if buf, err := readLump(LumpPlanes, 20); err != nil {
 		return nil, err
@@ -200,6 +211,49 @@ func parse(f interface {
 	}
 
 	return m, nil
+}
+
+// SpawnPoint parses the entity lump and returns the origin of the first
+// info_player_start entity, or ok=false if none is found.
+func (m *Map) SpawnPoint() (origin [3]float32, ok bool) {
+	// Entity lump is a series of { key "val" key "val" } blocks.
+	text := m.Entities
+	for {
+		start := strings.Index(text, "{")
+		end := strings.Index(text, "}")
+		if start < 0 || end < 0 || end < start {
+			break
+		}
+		block := text[start+1 : end]
+		text = text[end+1:]
+
+		if !strings.Contains(block, "info_player_start") {
+			continue
+		}
+		// Parse "origin" key.
+		const key = `"origin"`
+		ki := strings.Index(block, key)
+		if ki < 0 {
+			continue
+		}
+		rest := block[ki+len(key):]
+		// Skip whitespace, then read quoted value.
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if len(rest) == 0 || rest[0] != '"' {
+			continue
+		}
+		rest = rest[1:]
+		qend := strings.Index(rest, `"`)
+		if qend < 0 {
+			continue
+		}
+		val := rest[:qend]
+		var x, y, z float32
+		if n, _ := fmt.Sscanf(val, "%f %f %f", &x, &y, &z); n == 3 {
+			return [3]float32{x, y, z}, true
+		}
+	}
+	return [3]float32{}, false
 }
 
 func readStructSlice(buf []byte, dst any) {

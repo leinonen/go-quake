@@ -9,6 +9,12 @@ type InputEvent struct {
 	Dt                 float64
 }
 
+// EntityState carries per-frame render/collision state for one brush entity.
+type EntityState struct {
+	ModelIndex int
+	Offset     [3]float32
+}
+
 // PlayerState is the authoritative player position/orientation sent from physics to coordinator.
 type PlayerState struct {
 	Position   mgl32.Vec3
@@ -16,6 +22,7 @@ type PlayerState struct {
 	Yaw, Pitch float32
 	LeafIndex  int
 	OnGround   bool
+	Entities   []EntityState
 }
 
 // RenderFrame is sent from coordinator to renderer each frame.

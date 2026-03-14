@@ -13,6 +13,12 @@ import (
 	"go-quake/game"
 )
 
+// entityRenderable holds the VAO for one brush entity sub-model.
+type entityRenderable struct {
+	vao      uint32
+	numVerts int32
+}
+
 // Renderer owns all GL state and draws the world.
 type Renderer struct {
 	worldProg   uint32
@@ -28,11 +34,14 @@ type Renderer struct {
 	atlasTexture     uint32
 	atlasW, atlasH   int32
 
-	mvpLoc         int32
-	usePVSLoc      int32
-	totalFaceLoc   int32
-	atlasLoc       int32
-	atlasSizeLoc   int32
+	mvpLoc            int32
+	usePVSLoc         int32
+	totalFaceLoc      int32
+	atlasLoc          int32
+	atlasSizeLoc      int32
+	entityOffsetLoc   int32
+
+	entityVAOs []entityRenderable
 }
 
 // Init initialises GL state and uploads BSP geometry.
@@ -53,6 +62,7 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string, palette []byte) (*Ren
 	r.totalFaceLoc = gl.GetUniformLocation(prog, gl.Str("uTotalFaces\x00"))
 	r.atlasLoc = gl.GetUniformLocation(prog, gl.Str("uAtlas\x00"))
 	r.atlasSizeLoc = gl.GetUniformLocation(prog, gl.Str("uAtlasSize\x00"))
+	r.entityOffsetLoc = gl.GetUniformLocation(prog, gl.Str("uEntityOffset\x00"))
 
 	// Build texture atlas
 	atlasPixels, aw, ah, rects := buildAtlas(m.MipTexes, palette)
@@ -71,7 +81,7 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string, palette []byte) (*Ren
 	r.ssboFaceAtlas = buildFaceAtlasSSBO(m, rects)
 
 	// Build vertex buffer from BSP faces (6 floats per vertex: x,y,z, faceIdx, s, t)
-	verts := buildWorldVerts(m)
+	verts := buildModelVerts(m, 0)
 	r.numVerts = int32(len(verts) / 6)
 
 	gl.GenVertexArrays(1, &r.vao)
@@ -92,6 +102,29 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc string, palette []byte) (*Ren
 	gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 24, 16)
 
 	gl.BindVertexArray(0)
+
+	// Build VAOs for brush entity sub-models (Models[1..N])
+	for i := 1; i < len(m.Models); i++ {
+		ev := buildModelVerts(m, i)
+		if len(ev) == 0 {
+			r.entityVAOs = append(r.entityVAOs, entityRenderable{})
+			continue
+		}
+		var evao, evbo uint32
+		gl.GenVertexArrays(1, &evao)
+		gl.BindVertexArray(evao)
+		gl.GenBuffers(1, &evbo)
+		gl.BindBuffer(gl.ARRAY_BUFFER, evbo)
+		gl.BufferData(gl.ARRAY_BUFFER, len(ev)*4, unsafe.Pointer(&ev[0]), gl.STATIC_DRAW)
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 24, 0)
+		gl.EnableVertexAttribArray(1)
+		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 24, 12)
+		gl.EnableVertexAttribArray(2)
+		gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 24, 16)
+		gl.BindVertexArray(0)
+		r.entityVAOs = append(r.entityVAOs, entityRenderable{vao: evao, numVerts: int32(len(ev) / 6)})
+	}
 
 	// Compute shader
 	cs, err := InitCompute(m, computeSrc)
@@ -152,9 +185,31 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.Uniform1i(r.atlasLoc, 0)
 	gl.Uniform2f(r.atlasSizeLoc, float32(r.atlasW), float32(r.atlasH))
 
+	// Draw world (PVS on, no entity offset)
+	gl.Uniform3f(r.entityOffsetLoc, 0, 0, 0)
 	gl.BindVertexArray(r.vao)
 	gl.DrawArrays(gl.TRIANGLES, 0, r.numVerts)
 	gl.BindVertexArray(0)
+
+	// Draw brush entities (PVS off, per-entity offset)
+	if len(frame.Player.Entities) > 0 {
+		gl.Uniform1i(r.usePVSLoc, 0)
+		for _, es := range frame.Player.Entities {
+			idx := es.ModelIndex - 1
+			if idx < 0 || idx >= len(r.entityVAOs) {
+				continue
+			}
+			er := r.entityVAOs[idx]
+			if er.vao == 0 || er.numVerts == 0 {
+				continue
+			}
+			gl.Uniform3f(r.entityOffsetLoc, es.Offset[0], es.Offset[1], es.Offset[2])
+			gl.BindVertexArray(er.vao)
+			gl.DrawArrays(gl.TRIANGLES, 0, er.numVerts)
+			gl.BindVertexArray(0)
+		}
+		gl.Uniform1i(r.usePVSLoc, boolToInt32(r.usePVS))
+	}
 }
 
 // CountVisible returns visible face count (debug).
@@ -172,11 +227,13 @@ func boolToInt32(b bool) int32 {
 	return 0
 }
 
-// buildWorldVerts triangulates world model (Models[0]) BSP faces into a flat float32 slice.
-// Sub-models (Models[1..N]) are brush entities (doors, platforms) and are excluded.
+// buildModelVerts triangulates BSP faces for the given model index into a flat float32 slice.
 // Each vertex: x, y, z, faceIndex, s, t (6 floats; s/t are raw pixel-space texture coords).
-func buildWorldVerts(m *bsp.Map) []float32 {
-	world := m.Models[0]
+func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
+	if modelIdx < 0 || modelIdx >= len(m.Models) {
+		return nil
+	}
+	world := m.Models[modelIdx]
 	firstFace := int(world.FirstFace)
 	lastFace := firstFace + int(world.NumFaces)
 

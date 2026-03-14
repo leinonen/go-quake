@@ -6,6 +6,7 @@ import (
 	"github.com/go-gl/glfw/v3.3/glfw"
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
+	"go-quake/entities"
 	"go-quake/game"
 	"go-quake/vis"
 )
@@ -19,7 +20,7 @@ const (
 )
 
 // Run is the physics goroutine. It receives input events and emits player states.
-func Run(m *bsp.Map, bus *game.Bus, spawn mgl32.Vec3) {
+func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3) {
 	state := game.PlayerState{
 		Position: spawn,
 		Yaw:      0,
@@ -32,7 +33,7 @@ func Run(m *bsp.Map, bus *game.Bus, spawn mgl32.Vec3) {
 		case <-bus.Shutdown:
 			return
 		case ev := <-bus.Input:
-			state = tick(m, state, ev)
+			state = tick(m, mgr, state, ev)
 			// Non-blocking send to coordinator
 			select {
 			case bus.Physics <- state:
@@ -48,7 +49,7 @@ func Run(m *bsp.Map, bus *game.Bus, spawn mgl32.Vec3) {
 	}
 }
 
-func tick(m *bsp.Map, s game.PlayerState, ev game.InputEvent) game.PlayerState {
+func tick(m *bsp.Map, mgr *entities.Manager, s game.PlayerState, ev game.InputEvent) game.PlayerState {
 	// Mouse look
 	s.Yaw -= float32(ev.MouseDX * mouseSens)
 	s.Pitch -= float32(ev.MouseDY * mouseSens)
@@ -73,6 +74,9 @@ func tick(m *bsp.Map, s game.PlayerState, ev game.InputEvent) game.PlayerState {
 
 	// Player origin = eye position minus view height
 	origin := [3]float32{s.Position[0], s.Position[1], s.Position[2] - eyeHeight}
+
+	// Advance entity state machines before movement
+	mgr.Update(dt, m, origin)
 
 	yaw := float64(mgl32.DegToRad(s.Yaw))
 	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
@@ -114,11 +118,11 @@ func tick(m *bsp.Map, s game.PlayerState, ev game.InputEvent) game.PlayerState {
 
 	// Slide move
 	disp := [3]float32{s.Velocity[0] * dt, s.Velocity[1] * dt, s.Velocity[2] * dt}
-	newOrigin := slideMove(m.ClipNodes, m.Planes, hull, origin, disp)
+	newOrigin := slideMove(m, mgr.Entities, hull, origin, disp)
 
 	// Ground check: trace 2 units down from new position
 	groundEnd := [3]float32{newOrigin[0], newOrigin[1], newOrigin[2] - 2}
-	gtr := bsp.HullTrace(m.ClipNodes, m.Planes, hull, newOrigin, groundEnd)
+	gtr := traceAll(m, mgr.Entities, hull, newOrigin, groundEnd)
 	if gtr.Hit && gtr.Normal[2] > 0.7 {
 		s.OnGround = true
 		s.Velocity[2] = 0
@@ -129,14 +133,15 @@ func tick(m *bsp.Map, s game.PlayerState, ev game.InputEvent) game.PlayerState {
 
 	s.Position = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
 	s.LeafIndex = vis.LeafForPoint(m, [3]float32(s.Position))
+	s.Entities = mgr.States()
 
 	return s
 }
 
 // slideMove moves origin by disp, sliding along surfaces on impact (2-pass).
-func slideMove(clipNodes []bsp.DClipNode, planes []bsp.DPlane, hull int32, origin, disp [3]float32) [3]float32 {
+func slideMove(m *bsp.Map, ents []*entities.BrushEntity, hull int32, origin, disp [3]float32) [3]float32 {
 	end := [3]float32{origin[0] + disp[0], origin[1] + disp[1], origin[2] + disp[2]}
-	tr := bsp.HullTrace(clipNodes, planes, hull, origin, end)
+	tr := traceAll(m, ents, hull, origin, end)
 	if !tr.Hit {
 		return end
 	}
@@ -155,11 +160,44 @@ func slideMove(clipNodes []bsp.DClipNode, planes []bsp.DPlane, hull int32, origi
 
 	// Second pass along the slide direction.
 	end2 := [3]float32{tr.EndPos[0] + slide[0], tr.EndPos[1] + slide[1], tr.EndPos[2] + slide[2]}
-	tr2 := bsp.HullTrace(clipNodes, planes, hull, tr.EndPos, end2)
+	tr2 := traceAll(m, ents, hull, tr.EndPos, end2)
 	if !tr2.Hit {
 		return end2
 	}
 	return tr2.EndPos
+}
+
+// traceAll traces the segment start→end against the world hull and all entity hulls,
+// returning the earliest hit.
+func traceAll(m *bsp.Map, ents []*entities.BrushEntity, hull int32, start, end [3]float32) bsp.TraceResult {
+	best := bsp.HullTrace(m.ClipNodes, m.Planes, hull, start, end)
+	for _, ent := range ents {
+		entModel := m.Models[ent.ModelIndex]
+		entHull := entModel.HeadNodes[1]
+		mo := entModel.Origin
+		// Adjust trace into entity local space (entity origin + current offset)
+		adjStart := [3]float32{
+			start[0] - mo[0] - ent.Offset[0],
+			start[1] - mo[1] - ent.Offset[1],
+			start[2] - mo[2] - ent.Offset[2],
+		}
+		adjEnd := [3]float32{
+			end[0] - mo[0] - ent.Offset[0],
+			end[1] - mo[1] - ent.Offset[1],
+			end[2] - mo[2] - ent.Offset[2],
+		}
+		tr := bsp.HullTrace(m.ClipNodes, m.Planes, int32(entHull), adjStart, adjEnd)
+		if tr.Hit && (!best.Hit || tr.Fraction < best.Fraction) {
+			// Translate end position back to world space
+			tr.EndPos = [3]float32{
+				tr.EndPos[0] + mo[0] + ent.Offset[0],
+				tr.EndPos[1] + mo[1] + ent.Offset[1],
+				tr.EndPos[2] + mo[2] + ent.Offset[2],
+			}
+			best = tr
+		}
+	}
+	return best
 }
 
 // noclip is the fallback movement when no clip hull is available.

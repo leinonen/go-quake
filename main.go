@@ -14,6 +14,7 @@ import (
 	"github.com/go-gl/glfw/v3.3/glfw"
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
+	"go-quake/entities"
 	"go-quake/game"
 	"go-quake/input"
 	"go-quake/pak"
@@ -149,8 +150,11 @@ func main() {
 		log.Fatalf("renderer init: %v", err)
 	}
 
+	mgr := entities.NewManager(m)
+	log.Printf("brush entities: %d (func_door/func_plat)", len(mgr.Entities))
+
 	bus := game.NewBus()
-	go physics.Run(m, bus, spawn)
+	go physics.Run(m, mgr, bus, spawn)
 
 	playerState := game.PlayerState{Position: spawn}
 

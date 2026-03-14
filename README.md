@@ -41,6 +41,7 @@ go run . -map /path/to/e1m1.bsp
 - **Procedural skybox** — FBM cloud layers replace Quake sky polygons; no seams from any angle
 - **Procedural water** — sin-warp turbulence + caustic glints replace Quake water textures
 - **View weapon** — `v_axe.mdl` parsed from the PAK and rendered in camera space
+- **Item entity parsing** — weapons, armor, ammo, health, and keys parsed from the entity lump (rendering in progress)
 
 ## License
 

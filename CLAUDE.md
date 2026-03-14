@@ -30,12 +30,14 @@ bsp/
   loader.go          — parses BSP from file path or []byte (for PAK extraction)
   entities.go        — entity lump parser: ParseEntities, ParseVec3, ParseFloat, MoveDir
   clip.go            — BSP hull tracing (HullTrace, HullPointContents)
+  lighting.go        — FaceBrightness: per-face lightmap average (0–1) + sky/water sentinels (2.0/3.0)
 pak/
   pak.go             — reads id Software PAK archives; FindMaps(), ReadFile()
 vis/
   vis.go             — PVS RLE decompress, IsLeafVisible, LeafForPoint
 entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
+  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models)
 mdl/
   mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts, SkinRGB
 renderer/
@@ -139,5 +141,7 @@ The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mi
 - `CountVisible()` does a GPU→CPU readback every 30 frames (debug only); replace with `glMultiDrawArraysIndirect` for fully GPU-resident pipeline
 - No sound
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
-- No monster/item entities
+- Item entities parsed (`entities/items.go`) but not yet rendered — groundwork for weapons/armor/ammo/health on the floor
+- BSP lightmap brightness computed (`bsp/lighting.go`) but not yet wired into the renderer SSBO
 - Weapon renders frame 0 only — no swing animation, no view bob
+- No monster entities

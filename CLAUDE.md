@@ -15,7 +15,7 @@ go run . -pak /path/to/id1/pak0.pak
 go run . -map /path/to/e1m1.bsp
 ```
 
-Controls: WASD to move, mouse to look, Space/C to fly up/down, Escape to quit.
+Controls: WASD to move, mouse to look, Space to jump, Escape to quit.
 Title bar shows current leaf index and player position.
 
 ## package structure

@@ -2,6 +2,7 @@
 
 flat in uint vFaceIndex;
 in vec2 vTexST;
+in float vEyeDist;
 
 // SSBO 3: visible face flags (same binding as compute shader)
 layout(std430, binding = 3) readonly buffer VisibleFaces {
@@ -56,5 +57,12 @@ void main() {
         lightFactor = pow(b, 0.75); // mild gamma lift for linear lightmaps
     }
 
-    fragColor = vec4(color * lightFactor, 1.0);
+    // Exponential fog (greyish)
+    const vec3 fogColor = vec3(0.12, 0.12, 0.13);
+    const float fogDensity = 0.0013;
+    float fogFactor = exp(-fogDensity * vEyeDist);
+    fogFactor = clamp(fogFactor, 0.0, 1.0);
+
+    vec3 finalColor = mix(fogColor, color * lightFactor, fogFactor);
+    fragColor = vec4(finalColor, 1.0);
 }

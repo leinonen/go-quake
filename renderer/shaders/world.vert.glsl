@@ -9,9 +9,12 @@ uniform vec3 uEntityOffset;
 
 flat out uint vFaceIndex;
 out vec2 vTexST;
+out float vEyeDist;
 
 void main() {
-    gl_Position = uMVP * vec4(aPos + uEntityOffset, 1.0);
+    vec4 worldPos = vec4(aPos + uEntityOffset, 1.0);
+    gl_Position = uMVP * worldPos;
     vFaceIndex = uint(aFaceIndex);
     vTexST = aTexST;
+    vEyeDist = gl_Position.w; // clip-space w == eye-space z
 }

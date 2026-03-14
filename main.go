@@ -4,6 +4,9 @@ import (
 	_ "embed"
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"os"
 	"runtime"
@@ -192,9 +195,15 @@ func main() {
 
 	playerState := game.PlayerState{Position: spawn}
 
+	var screenshotRequested bool
 	win.SetKeyCallback(func(w *glfw.Window, key glfw.Key, _ int, action glfw.Action, _ glfw.ModifierKey) {
-		if key == glfw.KeyEscape && action == glfw.Press {
-			w.SetShouldClose(true)
+		if action == glfw.Press {
+			switch key {
+			case glfw.KeyEscape:
+				w.SetShouldClose(true)
+			case glfw.KeyF12:
+				screenshotRequested = true
+			}
 		}
 	})
 
@@ -235,6 +244,11 @@ func main() {
 
 		rend.Draw(game.RenderFrame{Player: playerState}, w, h)
 
+		if screenshotRequested {
+			screenshotRequested = false
+			saveScreenshot(w, h)
+		}
+
 		debugTick++
 		if debugTick%30 == 0 {
 			pos := [3]float32(playerState.Position)
@@ -254,4 +268,31 @@ func main() {
 	// finish cleanly.
 	win.SetInputMode(glfw.CursorMode, glfw.CursorNormal)
 	glfw.PollEvents()
+}
+
+func saveScreenshot(w, h int) {
+	pixels := make([]byte, w*h*3)
+	gl.ReadPixels(0, 0, int32(w), int32(h), gl.RGB, gl.UNSIGNED_BYTE, gl.Ptr(pixels))
+
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			i := (y*w + x) * 3
+			// Flip Y: OpenGL origin is bottom-left, image origin is top-left.
+			img.SetNRGBA(x, h-1-y, color.NRGBA{R: pixels[i], G: pixels[i+1], B: pixels[i+2], A: 255})
+		}
+	}
+
+	filename := fmt.Sprintf("screenshot_%s.png", time.Now().Format("20060102_150405"))
+	f, err := os.Create(filename)
+	if err != nil {
+		log.Printf("screenshot: %v", err)
+		return
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		log.Printf("screenshot encode: %v", err)
+		return
+	}
+	log.Printf("screenshot saved: %s", filename)
 }

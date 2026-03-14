@@ -2,7 +2,7 @@
 
 Minimalistic Quake 1 engine written in Go. Loads real BSP29 maps and renders them with a compute shader PVS pipeline.
 
-![screenshot placeholder]
+![screenshot](./docs/screenshot_20260314_100833.png)
 
 ## Requirements
 

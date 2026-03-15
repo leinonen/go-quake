@@ -19,6 +19,7 @@ import (
 	"go-quake/bsp"
 	"go-quake/entities"
 	"go-quake/game"
+	"go-quake/gfx"
 	"go-quake/input"
 	"go-quake/mdl"
 	"go-quake/pak"
@@ -85,6 +86,7 @@ func main() {
 	var itemSpawns []entities.ItemSpawn
 	var monsterStates []entities.MonsterState
 	var flameStates []entities.FlameState
+	var hudAssets *renderer.HUDAssets
 
 	switch {
 	case *pakPath != "":
@@ -110,6 +112,9 @@ func main() {
 
 		// Load palette for texture colour conversion
 		palette, _ = p.ReadFile("gfx/palette.lmp")
+
+		// Load HUD sprite assets.
+		hudAssets = loadHUDAssets(p, palette)
 
 		// Load view weapon MDLs for all 8 weapon slots.
 		viewWeaponPaths := [8]string{
@@ -300,7 +305,7 @@ func main() {
 		hudVertSrc, hudFragSrc,
 		partVertSrc, partFragSrc,
 		uwVertSrc, uwFragSrc,
-		palette, allWeaponModels[:], itemModels)
+		palette, allWeaponModels[:], itemModels, hudAssets)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}
@@ -412,6 +417,71 @@ func main() {
 // pakReader abstracts ReadFile from both pak.PAK and pak.MultiPAK.
 type pakReader interface {
 	ReadFile(name string) ([]byte, error)
+}
+
+// loadHUDAssets reads and decodes LMP sprites for the in-game status bar.
+// Missing files are silently skipped; the renderer falls back gracefully.
+func loadHUDAssets(p pakReader, palette []byte) *renderer.HUDAssets {
+	decodeLMP := func(path string) *gfx.LMPImage {
+		data, err := p.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		img, err := gfx.DecodeLMP(data, palette)
+		if err != nil {
+			log.Printf("HUD: decode %s: %v", path, err)
+			return nil
+		}
+		return img
+	}
+
+	a := &renderer.HUDAssets{}
+	a.SBar = decodeLMP("gfx/sbar.lmp")
+	if a.SBar == nil {
+		a.SBar = gfx.GenerateSBar()
+	}
+
+	for i := 0; i <= 9; i++ {
+		a.Nums[i] = decodeLMP(fmt.Sprintf("gfx/num_%d.lmp", i))
+		if a.Nums[i] == nil {
+			a.Nums[i] = gfx.GenerateDigit(i)
+		}
+	}
+
+	// Face sprites: try gfx/face1.lmp … gfx/face5.lmp first, then face1_0.lmp variant.
+	for i := 0; i < 5; i++ {
+		img := decodeLMP(fmt.Sprintf("gfx/face%d.lmp", i+1))
+		if img == nil {
+			img = decodeLMP(fmt.Sprintf("gfx/face%d_0.lmp", i+1))
+		}
+		if img == nil {
+			img = gfx.GenerateFace(i)
+		}
+		a.Faces[i] = img
+	}
+
+	log.Printf("HUD assets loaded (sbar=%v, nums=%v, faces=%v)",
+		a.SBar != nil,
+		func() int {
+			n := 0
+			for _, d := range a.Nums {
+				if d != nil {
+					n++
+				}
+			}
+			return n
+		}(),
+		func() int {
+			n := 0
+			for _, f := range a.Faces {
+				if f != nil {
+					n++
+				}
+			}
+			return n
+		}(),
+	)
+	return a
 }
 
 // loadItemModel loads one item model (MDL or BSP) and returns an ItemModel with all frames.

@@ -167,6 +167,15 @@ func (m *MultiPAK) ReadFile(name string) ([]byte, error) {
 	return nil, fmt.Errorf("%q not found in any PAK", name)
 }
 
+// List returns all file names across all paks (later paks last, no dedup).
+func (m *MultiPAK) List() []string {
+	var names []string
+	for _, p := range m.paks {
+		names = append(names, p.List()...)
+	}
+	return names
+}
+
 // FindMaps returns all .bsp paths across all paks, with later paks taking precedence.
 func (m *MultiPAK) FindMaps() []string {
 	seen := map[string]bool{}

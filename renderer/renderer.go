@@ -12,7 +12,32 @@ import (
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
 	"go-quake/game"
+	"go-quake/gfx"
 )
+
+// HUDAssets holds decoded LMP sprites for the in-game status bar.
+// All fields are optional; nil means that element won't be drawn.
+type HUDAssets struct {
+	SBar  *gfx.LMPImage    // status bar background (320×24)
+	Nums  [10]*gfx.LMPImage // big digit sprites 0–9
+	Faces [5]*gfx.LMPImage  // face sprites for health ranges (index 0 = high health)
+}
+
+// hudSprite stores normalised atlas UV coordinates for one sprite.
+type hudSprite struct{ u0, v0, u1, v1 float32 }
+
+// hudGradFragSrc is the fallback gradient health-bar shader used when no HUD assets are available.
+const hudGradFragSrc = `#version 430 core
+uniform float uFrac;
+in vec2 vUV;
+out vec4 FragColor;
+void main() {
+    if (vUV.x > uFrac) discard;
+    float r = 1.0 - uFrac;
+    float g = uFrac;
+    FragColor = vec4(r, g, 0.1, 1.0);
+}
+`
 
 // entityRenderable holds the VAO for one brush entity sub-model.
 type entityRenderable struct {
@@ -100,10 +125,22 @@ type Renderer struct {
 	weapMatLoc  int32
 	weapTexLoc  int32
 
-	// HUD health bar
-	hudProg    uint32
-	hudVAO     uint32
-	hudFracLoc int32
+	// HUD — gradient fallback (always available)
+	hudGradProg uint32
+	hudFracLoc  int32
+
+	// HUD — sprite atlas (used when HUDAssets were provided)
+	hudProg     uint32
+	hudTexLoc   int32
+	hudAtlasTex uint32
+	hudVAO      uint32
+	hudVBO      uint32
+	hudSBar     hudSprite
+	hudNums     [10]hudSprite
+	hudFaces    [5]hudSprite
+	hudSBarW    float32 // pixel width of sbar sprite
+	hudSBarH    float32 // pixel height of sbar sprite
+	hudValid    bool    // true when atlas sprites are ready
 
 	// underwater tint overlay
 	underwaterProg    uint32
@@ -157,7 +194,8 @@ func Init(m *bsp.Map,
 	uwVertSrc, uwFragSrc string,
 	palette []byte,
 	weapons []WeaponModel,
-	items []ItemModel) (*Renderer, error) {
+	items []ItemModel,
+	hudAssets *HUDAssets) (*Renderer, error) {
 
 	prog, err := compileRender(vertSrc, fragSrc)
 	if err != nil {
@@ -383,37 +421,39 @@ func Init(m *bsp.Map,
 		r.itemVAOs = append(r.itemVAOs, ir)
 	}
 
-	// HUD health bar — compile shader and upload static quad VAO
-	if len(hudVertSrc) > 0 && len(hudFragSrc) > 0 {
-		hp, err := compileRender(hudVertSrc, hudFragSrc)
+	// HUD — always compile gradient fallback shader.
+	if len(hudVertSrc) > 0 {
+		gp, err := compileRender(hudVertSrc, hudGradFragSrc)
 		if err != nil {
-			return nil, fmt.Errorf("compile HUD shaders: %w", err)
+			return nil, fmt.Errorf("compile HUD gradient shader: %w", err)
 		}
-		r.hudProg = hp
-		r.hudFracLoc = gl.GetUniformLocation(hp, gl.Str("uFrac\x00"))
-
-		// NDC quad covering bottom strip: x[-1,1], y[-1,-0.97], uv.x[0,1]
-		// Format: x, y, u, v (4 floats per vertex)
-		hudVerts := [...]float32{
-			-1, -1, 0, 0,
-			1, -1, 1, 0,
-			1, -0.97, 1, 1,
-			-1, -1, 0, 0,
-			1, -0.97, 1, 1,
-			-1, -0.97, 0, 1,
-		}
-		gl.GenVertexArrays(1, &r.hudVAO)
-		gl.BindVertexArray(r.hudVAO)
-		var hvbo uint32
-		gl.GenBuffers(1, &hvbo)
-		gl.BindBuffer(gl.ARRAY_BUFFER, hvbo)
-		gl.BufferData(gl.ARRAY_BUFFER, len(hudVerts)*4, unsafe.Pointer(&hudVerts[0]), gl.STATIC_DRAW)
-		gl.EnableVertexAttribArray(0)
-		gl.VertexAttribPointerWithOffset(0, 2, gl.FLOAT, false, 16, 0)
-		gl.EnableVertexAttribArray(1)
-		gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 16, 8)
-		gl.BindVertexArray(0)
+		r.hudGradProg = gp
+		r.hudFracLoc = gl.GetUniformLocation(gp, gl.Str("uFrac\x00"))
 	}
+
+	// HUD — compile atlas shader and build sprite atlas when assets are provided.
+	if hudAssets != nil && len(hudVertSrc) > 0 && len(hudFragSrc) > 0 {
+		ap, err := compileRender(hudVertSrc, hudFragSrc)
+		if err != nil {
+			return nil, fmt.Errorf("compile HUD atlas shader: %w", err)
+		}
+		r.hudProg = ap
+		r.hudTexLoc = gl.GetUniformLocation(ap, gl.Str("uHUDTex\x00"))
+		r.hudValid = buildHUDAtlas(r, hudAssets)
+	}
+
+	// HUD — dynamic VBO (shared by both gradient and atlas paths).
+	// Capacity: 64 quads × 6 verts × 4 floats per vert × 4 bytes.
+	gl.GenVertexArrays(1, &r.hudVAO)
+	gl.BindVertexArray(r.hudVAO)
+	gl.GenBuffers(1, &r.hudVBO)
+	gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
+	gl.BufferData(gl.ARRAY_BUFFER, 64*6*4*4, nil, gl.DYNAMIC_DRAW)
+	gl.EnableVertexAttribArray(0)
+	gl.VertexAttribPointerWithOffset(0, 2, gl.FLOAT, false, 16, 0)
+	gl.EnableVertexAttribArray(1)
+	gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 16, 8)
+	gl.BindVertexArray(0)
 
 	// Particle shader + dynamic VBO (512 particles × 5 floats × 4 bytes)
 	if len(partVertSrc) > 0 && len(partFragSrc) > 0 {
@@ -682,21 +722,56 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 		gl.Enable(gl.DEPTH_TEST)
 	}
 
-	// Draw HUD health bar — last, depth test disabled.
-	if r.hudProg != 0 {
+	// Draw HUD — last, depth test disabled.
+	if r.hudVAO != 0 {
 		gl.Disable(gl.DEPTH_TEST)
 		gl.Disable(gl.CULL_FACE)
-		gl.UseProgram(r.hudProg)
-		frac := float32(frame.Player.Health) / 100.0
-		if frac < 0 {
-			frac = 0
-		} else if frac > 1 {
-			frac = 1
+		gl.Enable(gl.BLEND)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+
+		if r.hudValid && r.hudProg != 0 {
+			// Sprite atlas path.
+			verts, nverts := r.buildHUDVerts(frame)
+			if nverts > 0 {
+				gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
+				gl.BufferSubData(gl.ARRAY_BUFFER, 0, nverts*16, unsafe.Pointer(&verts[0]))
+				gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+				gl.UseProgram(r.hudProg)
+				gl.ActiveTexture(gl.TEXTURE0)
+				gl.BindTexture(gl.TEXTURE_2D, r.hudAtlasTex)
+				gl.Uniform1i(r.hudTexLoc, 0)
+				gl.BindVertexArray(r.hudVAO)
+				gl.DrawArrays(gl.TRIANGLES, 0, int32(nverts))
+				gl.BindVertexArray(0)
+				gl.BindTexture(gl.TEXTURE_2D, 0)
+			}
+		} else if r.hudGradProg != 0 {
+			// Gradient fallback path.
+			frac := float32(frame.Player.Health) / 100.0
+			if frac < 0 {
+				frac = 0
+			} else if frac > 1 {
+				frac = 1
+			}
+			gradVerts := [24]float32{
+				-1, -1, 0, 0,
+				1, -1, 1, 0,
+				1, -0.97, 1, 1,
+				-1, -1, 0, 0,
+				1, -0.97, 1, 1,
+				-1, -0.97, 0, 1,
+			}
+			gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
+			gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(gradVerts)*4, unsafe.Pointer(&gradVerts[0]))
+			gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+			gl.UseProgram(r.hudGradProg)
+			gl.Uniform1f(r.hudFracLoc, frac)
+			gl.BindVertexArray(r.hudVAO)
+			gl.DrawArrays(gl.TRIANGLES, 0, 6)
+			gl.BindVertexArray(0)
 		}
-		gl.Uniform1f(r.hudFracLoc, frac)
-		gl.BindVertexArray(r.hudVAO)
-		gl.DrawArrays(gl.TRIANGLES, 0, 6)
-		gl.BindVertexArray(0)
+
+		gl.Disable(gl.BLEND)
 		gl.Enable(gl.CULL_FACE)
 		gl.Enable(gl.DEPTH_TEST)
 	}
@@ -996,6 +1071,196 @@ func makeBrightnessSSBO(brightness []float32) uint32 {
 	gl.BufferData(gl.SHADER_STORAGE_BUFFER, len(brightness)*4, unsafe.Pointer(&brightness[0]), gl.STATIC_DRAW)
 	gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, 0)
 	return ssbo
+}
+
+// buildHUDAtlas packs the HUD LMP sprites into a single RGBA GL texture.
+// Returns true if at least the sbar or some sprites were packed successfully.
+func buildHUDAtlas(r *Renderer, a *HUDAssets) bool {
+	const atlasW = 512
+
+	// Measure row heights.
+	sbarH := 0
+	spriteH := 0
+	if a.SBar != nil {
+		sbarH = a.SBar.Height
+	}
+	for _, n := range a.Nums {
+		if n != nil && n.Height > spriteH {
+			spriteH = n.Height
+		}
+	}
+	for _, f := range a.Faces {
+		if f != nil && f.Height > spriteH {
+			spriteH = f.Height
+		}
+	}
+	if sbarH == 0 && spriteH == 0 {
+		return false
+	}
+
+	// Layout: row0 = sbar, row1 = digits + faces.
+	row1Y := sbarH
+	if row1Y > 0 {
+		row1Y++ // 1px padding
+	}
+	rawH := row1Y + spriteH + 1
+	atlasH := 1
+	for atlasH < rawH {
+		atlasH <<= 1
+	}
+	invW := float32(1) / float32(atlasW)
+	invH := float32(1) / float32(atlasH)
+
+	pixels := make([]byte, atlasW*atlasH*4)
+
+	blit := func(img *gfx.LMPImage, destX, destY int) {
+		for py := 0; py < img.Height; py++ {
+			for px := 0; px < img.Width; px++ {
+				src := (py*img.Width + px) * 4
+				dst := ((destY+py)*atlasW + (destX + px)) * 4
+				if dst+3 < len(pixels) {
+					pixels[dst+0] = img.RGBA[src+0]
+					pixels[dst+1] = img.RGBA[src+1]
+					pixels[dst+2] = img.RGBA[src+2]
+					pixels[dst+3] = img.RGBA[src+3]
+				}
+			}
+		}
+	}
+
+	sprite := func(x, y, w, h int) hudSprite {
+		return hudSprite{
+			u0: float32(x) * invW,
+			v0: float32(y) * invH,
+			u1: float32(x+w) * invW,
+			v1: float32(y+h) * invH,
+		}
+	}
+
+	// Row 0: sbar.
+	if a.SBar != nil {
+		blit(a.SBar, 0, 0)
+		r.hudSBar = sprite(0, 0, a.SBar.Width, a.SBar.Height)
+		r.hudSBarW = float32(a.SBar.Width)
+		r.hudSBarH = float32(a.SBar.Height)
+	}
+
+	// Row 1: digits then faces.
+	const digitW = 24
+	for i, n := range a.Nums {
+		if n == nil {
+			continue
+		}
+		dx := i * digitW
+		blit(n, dx, row1Y)
+		r.hudNums[i] = sprite(dx, row1Y, n.Width, n.Height)
+	}
+	const faceStartX = 10 * digitW // 240
+	for i, f := range a.Faces {
+		if f == nil {
+			continue
+		}
+		fx := faceStartX + i*digitW
+		blit(f, fx, row1Y)
+		r.hudFaces[i] = sprite(fx, row1Y, f.Width, f.Height)
+	}
+
+	// Upload atlas texture.
+	gl.GenTextures(1, &r.hudAtlasTex)
+	gl.BindTexture(gl.TEXTURE_2D, r.hudAtlasTex)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, int32(atlasW), int32(atlasH), 0,
+		gl.RGBA, gl.UNSIGNED_BYTE, unsafe.Pointer(&pixels[0]))
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.BindTexture(gl.TEXTURE_2D, 0)
+
+	return true
+}
+
+// buildHUDVerts builds a flat float32 slice of HUD quads for this frame.
+// Each quad is 6 vertices × 4 floats (x, y, u, v).
+// Returns the slice and the vertex count.
+func (r *Renderer) buildHUDVerts(frame game.RenderFrame) ([]float32, int) {
+	// HUD occupies bottom strip in NDC. Virtual HUD coords: 0..320 wide, 0..sbarH tall.
+	refW := float32(320)
+	refH := r.hudSBarH
+	if refH <= 0 {
+		refH = 24
+	}
+	const hudNDCHeight = float32(0.15) // fraction of [-1,1] y range the HUD occupies
+
+	ndcX := func(vx float32) float32 { return (vx/refW)*2.0 - 1.0 }
+	ndcY := func(vy float32) float32 { return -1.0 + (vy/refH)*hudNDCHeight }
+
+	var verts []float32
+
+	quad := func(vx0, vy0, vx1, vy1 float32, sp hudSprite) {
+		x0, y0 := ndcX(vx0), ndcY(vy0)
+		x1, y1 := ndcX(vx1), ndcY(vy1)
+		verts = append(verts,
+			x0, y0, sp.u0, sp.v1,
+			x1, y0, sp.u1, sp.v1,
+			x1, y1, sp.u1, sp.v0,
+			x0, y0, sp.u0, sp.v1,
+			x1, y1, sp.u1, sp.v0,
+			x0, y1, sp.u0, sp.v0,
+		)
+	}
+
+	// 1. Status bar background.
+	if r.hudSBarW > 0 && r.hudSBarH > 0 {
+		quad(0, 0, r.hudSBarW, r.hudSBarH, r.hudSBar)
+	}
+
+	// 2. Health digits at vx=136 (three digits, right-justified).
+	health := frame.Player.Health
+	if health < 0 {
+		health = 0
+	}
+	if health > 999 {
+		health = 999
+	}
+	drawDigits := func(value, vx int) {
+		d2 := value / 100
+		d1 := (value / 10) % 10
+		d0 := value % 10
+		const dw = float32(24)
+		const dh = float32(24)
+		quad(float32(vx), 0, float32(vx)+dw, dh, r.hudNums[d2])
+		quad(float32(vx)+dw, 0, float32(vx)+dw*2, dh, r.hudNums[d1])
+		quad(float32(vx)+dw*2, 0, float32(vx)+dw*3, dh, r.hudNums[d0])
+	}
+	drawDigits(health, 136)
+
+	// 3. Face sprite — health range: 0 = high, 4 = low.
+	faceIdx := (100 - health) / 20
+	if faceIdx > 4 {
+		faceIdx = 4
+	}
+	if faceIdx < 0 {
+		faceIdx = 0
+	}
+	if r.hudFaces[faceIdx].u1 > r.hudFaces[faceIdx].u0 {
+		quad(112, 0, 136, 24, r.hudFaces[faceIdx])
+	}
+
+	// 4. Ammo digits at vx=248.
+	ammo := 0
+	cw := frame.Player.CurrentWeapon
+	if cw >= 0 && cw < len(frame.Player.WeaponAmmo) {
+		ammo = frame.Player.WeaponAmmo[cw]
+	}
+	if ammo < 0 {
+		ammo = 0
+	}
+	if ammo > 999 {
+		ammo = 999
+	}
+	drawDigits(ammo, 248)
+
+	return verts, len(verts) / 4
 }
 
 func linkProgram(shaders ...uint32) (uint32, error) {

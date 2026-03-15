@@ -30,7 +30,7 @@ go run . -map /path/to/e1m1.bsp
 | WASD | Move |
 | Mouse | Look |
 | Space | Jump |
-| Left mouse button | Axe swing |
+| Left mouse button | Attack (axe swing / shoot) |
 | Escape | Quit |
 | F12 | Screenshot |
 
@@ -47,7 +47,7 @@ go run . -map /path/to/e1m1.bsp
 - **Item pickup** — weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP
 - **Monster AI** — all 15 Quake monster types animate, alert on line-of-sight, chase, and melee attack; blocked by closed doors; subject to gravity
 - **Blood particles** — axe hits spray ~80 physics-simulated particles in a wide cone; particles arc with gravity, splat on walls and floors, then fade out
-- **Combat** — left-click swings the axe; hit detection fires at frame 2 of the swing; monsters have 30 HP and die permanently
+- **Combat** — left-click attacks with the active weapon: axe (melee swing, hit at frame 2), shotgun/super shotgun (hitscan pellets with spread), nailgun/super nailgun (full-auto hitscan), rocket/grenade launcher, lightning gun; weapons switched with keys 1–8
 - **Player health** — starts at 100 HP; monsters deal 10 damage per hit; health bar at screen bottom; death teleports back to spawn
 - **Respawn** — on death the player resets to spawn, HP restores to 100, and all monsters un-alert
 

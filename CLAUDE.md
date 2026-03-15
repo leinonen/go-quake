@@ -15,7 +15,7 @@ go run . -pak /path/to/id1/pak0.pak
 go run . -map /path/to/e1m1.bsp
 ```
 
-Controls: WASD to move, mouse to look, Space to jump, left-click to swing axe, Escape to quit.
+Controls: WASD to move, mouse to look, Space to jump, left-click to attack (axe swing or shoot), keys 1–8 to switch weapons, Escape to quit.
 Title bar shows current HP, leaf index, and player position.
 
 ## package structure
@@ -147,13 +147,24 @@ The weapon is positioned in GL camera space via:
 
 The active VAO is selected each frame by `frame.Player.WeaponFrame`. If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
 
-## weapon swing
+## weapon firing
 
-Physics drives the axe animation in `tickWeapon`:
-- Left mouse button press (not already swinging) starts the swing at frame 1
-- Frames advance at 8 FPS; hit detection fires when `weaponFrame >= 2` (first time per swing)
-- `tryAxeHit` casts a 64-unit forward ray from eye position; monsters within 40 units of the ray tip take 25 damage
-- When the frame counter reaches `NumFrames`, the swing ends and the weapon returns to frame 0
+`tickWeapon` dispatches to the active weapon's tick each physics frame. Weapons switch via keys 1–8 (slot must be owned and have ammo).
+
+**Axe (slot 0):** melee swing driven by MDL animation
+- Left mouse button starts swing at frame 1; frames advance at 8 FPS
+- `tryAxeHit` fires on `weaponFrame >= 2` (once per swing): casts a 64-unit ray from eye, deals 25 damage to monsters within 40 units of ray tip
+- Swing ends when `weaponFrame` reaches `NumFrames`; returns to frame 0
+
+**Hitscan weapons (slots 1–7):** `fireHitscan(numPellets, spread, damage)` casts rays from eye
+- Shotgun (1): semi-auto, 1 shell, spread pellets, 4 damage each
+- Super shotgun (2): semi-auto, 2 shells, more pellets, higher spread
+- Nailgun (3): full-auto, 1 nail/shot, 9 damage
+- Super nailgun (4): full-auto, 2 nails/shot, 18 damage
+- Rocket/grenade launcher (5): semi-auto, simulated via hitscan, 100–120 damage
+- Lightning gun (7): full-auto, 1 cell/shot, 30 damage
+
+Auto-switch (`autoSwitchWeapon`) triggers when the current weapon runs out of ammo.
 
 ## item pickup system
 
@@ -205,7 +216,7 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Interactive doors and elevators: proximity-triggered state machines with BSP hull collision.
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
-- View weapon: `v_axe.mdl` rendered in camera space with full swing animation and hit detection.
+- View weapon: `v_axe.mdl` rendered in camera space with full swing animation and hit detection; hitscan weapons (shotgun through lightning gun) share the same firing input and auto-switch on empty ammo.
 - Item pickup: weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP.
 - Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.
 - Player respawn: death teleports back to spawn with full HP and reset monster alert state.

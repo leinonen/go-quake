@@ -105,6 +105,11 @@ type Renderer struct {
 	hudVAO     uint32
 	hudFracLoc int32
 
+	// underwater tint overlay
+	underwaterProg    uint32
+	underwaterVAO     uint32
+	underwaterTimeLoc int32
+
 	// blood particles
 	particleProg    uint32
 	particleVAO     uint32
@@ -148,7 +153,8 @@ func Init(m *bsp.Map,
 	skyVertSrc, skyFragSrc,
 	weapVertSrc, weapFragSrc,
 	hudVertSrc, hudFragSrc,
-	partVertSrc, partFragSrc string,
+	partVertSrc, partFragSrc,
+	uwVertSrc, uwFragSrc string,
 	palette []byte,
 	weapons []WeaponModel,
 	items []ItemModel) (*Renderer, error) {
@@ -438,6 +444,35 @@ func Init(m *bsp.Map,
 		r.particleScratch = make([]float32, 0, 2048*5)
 	}
 
+	// Underwater tint overlay — fullscreen quad shader
+	if len(uwVertSrc) > 0 && len(uwFragSrc) > 0 {
+		up, err := compileRender(uwVertSrc, uwFragSrc)
+		if err != nil {
+			return nil, fmt.Errorf("compile underwater shaders: %w", err)
+		}
+		r.underwaterProg = up
+		r.underwaterTimeLoc = gl.GetUniformLocation(up, gl.Str("uTime\x00"))
+
+		// Fullscreen NDC quad: x[-1,1], y[-1,1], 6 vertices, 2 floats each
+		uwVerts := [...]float32{
+			-1, -1,
+			1, -1,
+			1, 1,
+			-1, -1,
+			1, 1,
+			-1, 1,
+		}
+		gl.GenVertexArrays(1, &r.underwaterVAO)
+		gl.BindVertexArray(r.underwaterVAO)
+		var uwVBO uint32
+		gl.GenBuffers(1, &uwVBO)
+		gl.BindBuffer(gl.ARRAY_BUFFER, uwVBO)
+		gl.BufferData(gl.ARRAY_BUFFER, len(uwVerts)*4, unsafe.Pointer(&uwVerts[0]), gl.STATIC_DRAW)
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointerWithOffset(0, 2, gl.FLOAT, false, 8, 0)
+		gl.BindVertexArray(0)
+	}
+
 	return r, nil
 }
 
@@ -511,6 +546,20 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 		gl.Uniform1i(r.usePVSLoc, boolToInt32(r.usePVS))
 	}
 
+	// Draw skybox — rotation-only view so it's infinitely far away.
+	skyView := mgl32.LookAtV(mgl32.Vec3{0, 0, 0}, forward, up)
+	skyMVP := proj.Mul4(skyView)
+	gl.DepthFunc(gl.LEQUAL)
+	gl.Disable(gl.CULL_FACE)
+	gl.UseProgram(r.skyProg)
+	gl.UniformMatrix4fv(r.skyMVPLoc, 1, false, &skyMVP[0])
+	gl.Uniform1f(r.skyTimeLoc, float32(time.Since(r.startTime).Seconds()))
+	gl.BindVertexArray(r.skyVAO)
+	gl.DrawArrays(gl.TRIANGLES, 0, 36)
+	gl.BindVertexArray(0)
+	gl.Enable(gl.CULL_FACE)
+	gl.DepthFunc(gl.LESS)
+
 	// Draw world items and monsters — MDL/BSP models at their origins.
 	if r.weaponProg != 0 && len(frame.Items) > 0 {
 		gl.Disable(gl.CULL_FACE)
@@ -543,20 +592,6 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 		gl.BindTexture(gl.TEXTURE_2D, 0)
 		gl.Enable(gl.CULL_FACE)
 	}
-
-	// Draw skybox last — rotation-only view so it's infinitely far away.
-	skyView := mgl32.LookAtV(mgl32.Vec3{0, 0, 0}, forward, up)
-	skyMVP := proj.Mul4(skyView)
-	gl.DepthFunc(gl.LEQUAL)
-	gl.Disable(gl.CULL_FACE)
-	gl.UseProgram(r.skyProg)
-	gl.UniformMatrix4fv(r.skyMVPLoc, 1, false, &skyMVP[0])
-	gl.Uniform1f(r.skyTimeLoc, float32(time.Since(r.startTime).Seconds()))
-	gl.BindVertexArray(r.skyVAO)
-	gl.DrawArrays(gl.TRIANGLES, 0, 36)
-	gl.BindVertexArray(0)
-	gl.Enable(gl.CULL_FACE)
-	gl.DepthFunc(gl.LESS)
 
 	// Draw blood particles — alpha blended, depth write off.
 	if r.particleProg != 0 && len(frame.Player.Particles) > 0 {
@@ -629,6 +664,22 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 
 			gl.Enable(gl.CULL_FACE)
 		}
+	}
+
+	// Draw underwater tint — after weapon so it tints both world and weapon, before HUD.
+	if r.underwaterProg != 0 && frame.Player.InWater {
+		gl.Disable(gl.DEPTH_TEST)
+		gl.Disable(gl.CULL_FACE)
+		gl.Enable(gl.BLEND)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+		gl.UseProgram(r.underwaterProg)
+		gl.Uniform1f(r.underwaterTimeLoc, float32(time.Since(r.startTime).Seconds()))
+		gl.BindVertexArray(r.underwaterVAO)
+		gl.DrawArrays(gl.TRIANGLES, 0, 6)
+		gl.BindVertexArray(0)
+		gl.Disable(gl.BLEND)
+		gl.Enable(gl.CULL_FACE)
+		gl.Enable(gl.DEPTH_TEST)
 	}
 
 	// Draw HUD health bar — last, depth test disabled.

@@ -56,6 +56,8 @@ renderer/
     hud.frag.glsl      — health bar: discards pixels where vUV.x > uFrac; colour transitions green→red
     particle.vert.glsl — GL_POINTS with depth-scaled point size (2–16px); passes vLife, vStuck
     particle.frag.glsl — circular disc via gl_PointCoord; fresh red → dried dark red; alpha = edge * vLife
+    underwater.vert.glsl — fullscreen NDC quad passthrough; computes vUV from aPos
+    underwater.frag.glsl — blue-green tint (vec4(0.0, 0.25, 0.45, 0.35)) with animated ripple via uTime
 physics/
   physics.go         — WASD + mouselook, gravity, jumping, BSP collision, weapon swing, monster AI; own goroutine
 input/
@@ -122,6 +124,14 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 - Foam-edge highlight where the two wave systems clash (`abs(w1 - w2)`)
 - Animated via `uTime` uniform (elapsed seconds since renderer init)
 
+## underwater tint
+
+When the player's eye is inside a water leaf, a full-screen blue-green overlay is drawn over the entire frame including the view weapon.
+
+- **Detection:** `physics/physics.go` checks `m.Leaves[leafIndex].Contents == ContentsWater` after every `LeafForPoint` call (init, `tick()`, respawn, noclip); result stored in `PlayerState.InWater`
+- **Shaders:** `underwater.vert.glsl` emits a fullscreen NDC quad; `underwater.frag.glsl` outputs `vec4(0.0, 0.25+wave, 0.45+wave, 0.35)` with a subtle animated ripple via `uTime`
+- **Draw position:** after weapon depth-clear and weapon draw, before HUD — so both world and weapon receive the tint but the HUD remains unaffected
+
 ## lightmap atlas
 
 BSP29 lightmaps are 1 byte per texel (grayscale luminance). `BuildLightmapAtlas` in `bsp/lighting.go` shelf-packs all face lightmaps into a single `2048×N` RGB texture (grayscale replicated to all 3 channels):
@@ -139,7 +149,7 @@ BSP29 lightmaps are 1 byte per texel (grayscale luminance). `BuildLightmapAtlas`
 
 `progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. All animation frames are built into separate VAOs (interleaved `x,y,z,u,v`, 5 floats per vertex, no index buffer). The skin texture is uploaded once and shared across frames.
 
-Draw order: world → brush entities → items/monsters → skybox → **particles** (blend on, depth write off) → (depth clear) → **weapon** → **HUD**.
+Draw order: world → brush entities → skybox → items/monsters → **particles** (blend on, depth write off) → (depth clear) → **weapon** → **underwater tint** → **HUD**.
 
 The weapon is positioned in GL camera space via:
 - `RotX(-90) * RotZ(90)` — converts Quake view space (X=forward, -Y=right, Z=up) to GL camera space (-Z=forward, +X=right, +Y=up)
@@ -215,7 +225,7 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Emergent game loop: no central tick. Input, physics, and rendering are goroutines communicating via typed channels. Vsync (`SwapInterval(1)`) is the only throttle.
 - Interactive doors and elevators: proximity-triggered state machines with BSP hull collision.
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
-- Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
+- Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics; screen-space blue-green tint when submerged.
 - View weapon: `v_axe.mdl` rendered in camera space with full swing animation and hit detection; hitscan weapons (shotgun through lightning gun) share the same firing input and auto-switch on empty ammo.
 - Item pickup: weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP.
 - Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.

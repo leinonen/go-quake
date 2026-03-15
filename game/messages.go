@@ -37,6 +37,7 @@ type PlayerState struct {
 	WeaponAmmo    [8]int   // ammo per type; index matches AmmoShells..AmmoCells constants
 	MonsterItems  []ItemState     // live monster positions + frame indices (set by physics)
 	Particles     []ParticleState // live blood particles (set by physics)
+	InWater       bool            // true when eye position is inside a water leaf
 }
 
 // ItemState carries the world position, mesh index, animation frame, and facing yaw for one item or monster.

@@ -42,7 +42,7 @@ go run . -map /path/to/e1m1.bsp
 - **BSP collision** — hull tracing against the world and brush entities (func_door, func_plat)
 - **Interactive doors and elevators** — proximity-triggered state machines with full collision
 - **Procedural skybox** — FBM cloud layers replace Quake sky polygons; no seams from any angle
-- **Procedural water** — sin-warp turbulence + caustic glints replace Quake water textures
+- **Procedural water** — sin-warp turbulence + caustic glints replace Quake water textures; screen-space blue-green tint overlay when submerged
 - **View weapon** — `v_axe.mdl` rendered in camera space with full swing animation
 - **Item pickup** — weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP
 - **Flame entities** — `light_flame_*` classnames parsed and rendered as animated `flame2.mdl`; purely decorative, no AI or collision

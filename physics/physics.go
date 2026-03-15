@@ -90,6 +90,7 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
 	ps.hasWeapon[0] = true // axe always owned
 	ps.particleScratch = make([]game.ParticleState, 0, particleCount)
 	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+	ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
 
 	picked := make([]bool, len(items))
 
@@ -254,6 +255,7 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 
 	ps.player.Position = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
 	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+	ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
 	ps.player.Entities = mgr.States()
 
 	// Weapon tick
@@ -273,6 +275,7 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 		ps.player.OnGround = false
 		ps.playerHP = 100
 		ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+		ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
 		for i := range ps.monsters {
 			ps.monsters[i].Alerted = false
 		}
@@ -1073,6 +1076,7 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 	}
 	ps.player.Position = ps.player.Position.Add(move)
 	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+	ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
 
 	tickWeapon(ps, ev, dt)
 	tickMonsters(m, nil, ps, dt)

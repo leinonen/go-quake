@@ -589,7 +589,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 				rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
 				rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
 				rot := rotX.Mul4(rotZ)
-				trans := mgl32.Translate3D(6, -10, -14)
+				trans := mgl32.Translate3D(0, -10, -10)
 				weaponMat := trans.Mul4(rot)
 
 				gl.UseProgram(r.weaponProg)

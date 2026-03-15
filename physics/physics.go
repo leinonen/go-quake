@@ -2,6 +2,7 @@ package physics
 
 import (
 	"math"
+	"math/rand"
 
 	"github.com/go-gl/glfw/v3.3/glfw"
 	"github.com/go-gl/mathgl/mgl32"
@@ -12,27 +13,46 @@ import (
 )
 
 const (
-	mouseSens    = 0.15
-	moveSpeed    = 320.0 // units/s, classic Quake speed
-	eyeHeight    = 22.0  // view height above player origin (Quake DEFAULT_VIEWHEIGHT)
-	gravity      = 800.0 // units/s^2
-	jumpSpeed    = 270.0 // initial Z velocity on jump
-	pickupRadius = 32.0  // item touch radius (Quake standard)
-	weaponFPS    = 8.0   // weapon animation frames per second
-	weaponHitFrame = 2   // axe MDL frame index at which hit detection fires
+	mouseSens      = 0.15
+	moveSpeed      = 320.0 // units/s, classic Quake speed
+	eyeHeight      = 22.0  // view height above player origin (Quake DEFAULT_VIEWHEIGHT)
+	gravity        = 800.0 // units/s^2
+	jumpSpeed      = 270.0 // initial Z velocity on jump
+	pickupRadius   = 32.0  // item touch radius (Quake standard)
+	weaponFPS      = 8.0   // weapon animation frames per second
+	weaponHitFrame = 2     // axe MDL frame index at which hit detection fires
+
+	particleCount     = 2048
+	particleFlyLife   = 4.0   // seconds airborne
+	particleStuckLife = 7.0   // seconds as decal
+	particleSpeed     = 350.0 // units/s base spray speed
+	particleSpread    = 1.4   // lateral cone factor
+	particleEmitCount = 80    // per hit
 )
+
+// particle is an internal blood particle, owned by the physics goroutine.
+type particle struct {
+	Pos, Vel [3]float32
+	Life     float32
+	MaxLife  float32
+	Stuck    bool
+	Active   bool
+}
 
 // physicsState holds all mutable physics state between ticks.
 type physicsState struct {
-	player         game.PlayerState
-	playerHP       int
-	respawnPos     mgl32.Vec3
-	weaponFrame    int
+	player          game.PlayerState
+	playerHP        int
+	respawnPos      mgl32.Vec3
+	weaponFrame     int
 	weaponFrameTime float32
 	weaponSwinging  bool
 	hitFired        bool
 	weaponNumFrames int
 	monsters        []entities.MonsterState
+	particles       [particleCount]particle
+	particleScratch []game.ParticleState // pre-alloc, reused each tick
+	nextFreeHint    int                  // amortised free-slot cursor
 }
 
 // Run is the physics goroutine. It receives input events and emits player states.
@@ -49,6 +69,7 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
 		weaponNumFrames: numWeaponFrames,
 		monsters:        monsters,
 	}
+	ps.particleScratch = make([]game.ParticleState, 0, particleCount)
 	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
 
 	picked := make([]bool, len(items))
@@ -196,6 +217,9 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 	// Monster tick (pass brush entities for door collision)
 	tickMonsters(m, mgr.Entities, ps, dt)
 
+	// Particle tick
+	tickParticles(m, ps, dt)
+
 	// Respawn on death
 	if ps.playerHP <= 0 {
 		ps.player.Position = ps.respawnPos
@@ -225,6 +249,8 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 			Yaw:    mn.Yaw,
 		})
 	}
+
+	buildParticleItems(ps)
 }
 
 // tickWeapon advances axe animation and fires hit detection.
@@ -294,6 +320,7 @@ func tryAxeHit(ps *physicsState) {
 			if mn.HP < 0 {
 				mn.HP = 0
 			}
+			emitBloodParticles(ps, mn.Pos, fwdX, fwdY, fwdZ)
 		}
 	}
 }
@@ -430,6 +457,113 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 			mn.AttackCooldown = entities.MonsterAttackCooldown
 		}
 	}
+}
+
+// emitBloodParticles sprays blood from origin toward the hit direction.
+func emitBloodParticles(ps *physicsState, origin [3]float32, fwdX, fwdY, fwdZ float32) {
+	emitted := 0
+	for emitted < particleEmitCount {
+		// Find a free slot starting from the hint cursor.
+		found := false
+		for range ps.particles {
+			i := ps.nextFreeHint % particleCount
+			ps.nextFreeHint++
+			if !ps.particles[i].Active {
+				// Random cone spread around the forward vector.
+				lx := fwdX + (rand.Float32()*2-1)*particleSpread
+				ly := fwdY + (rand.Float32()*2-1)*particleSpread
+				lz := fwdZ + (rand.Float32()*2-1)*particleSpread
+				// Normalise
+				mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
+				if mag < 1e-6 {
+					mag = 1
+				}
+				speed := particleSpeed * (0.5 + rand.Float32()*0.5)
+				ps.particles[i] = particle{
+					Pos:     origin,
+					Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
+					Life:    particleFlyLife,
+					MaxLife: particleFlyLife,
+					Active:  true,
+					Stuck:   false,
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			break // pool exhausted
+		}
+		emitted++
+	}
+}
+
+// tickParticles advances all active particles for one physics tick.
+func tickParticles(m *bsp.Map, ps *physicsState, dt float32) {
+	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
+		return
+	}
+	pointHull := m.Models[0].HeadNodes[0]
+	for i := range ps.particles {
+		p := &ps.particles[i]
+		if !p.Active {
+			continue
+		}
+		p.Life -= dt
+		if p.Life <= 0 {
+			p.Active = false
+			continue
+		}
+		if p.Stuck {
+			continue
+		}
+		// Apply gravity
+		p.Vel[2] -= gravity * dt
+		end := [3]float32{
+			p.Pos[0] + p.Vel[0]*dt,
+			p.Pos[1] + p.Vel[1]*dt,
+			p.Pos[2] + p.Vel[2]*dt,
+		}
+		tr := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, p.Pos, end)
+		if tr.StartSolid {
+			p.Stuck = true
+			if p.Life > particleStuckLife {
+				p.Life = particleStuckLife
+				p.MaxLife = p.Life
+			}
+		} else if tr.Hit {
+			p.Pos = tr.EndPos
+			p.Vel = [3]float32{}
+			p.Stuck = true
+			if p.Life > particleStuckLife {
+				p.Life = particleStuckLife
+				p.MaxLife = p.Life
+			}
+		} else {
+			p.Pos = end
+		}
+	}
+}
+
+// buildParticleItems collects active particles into ps.particleScratch.
+func buildParticleItems(ps *physicsState) {
+	ps.particleScratch = ps.particleScratch[:0]
+	for i := range ps.particles {
+		p := &ps.particles[i]
+		if !p.Active {
+			continue
+		}
+		life := float32(1)
+		if p.MaxLife > 0 {
+			life = p.Life / p.MaxLife
+		}
+		ps.particleScratch = append(ps.particleScratch, game.ParticleState{
+			Pos:   p.Pos,
+			Life:  life,
+			Stuck: p.Stuck,
+		})
+	}
+	ps.player.Particles = ps.particleScratch
 }
 
 // monsterMoveTrace traces a point through world + brush entities using the point hull.
@@ -580,6 +714,7 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 
 	tickWeapon(ps, ev, dt)
 	tickMonsters(m, nil, ps, dt)
+	tickParticles(m, ps, dt)
 
 	ps.player.Health = ps.playerHP
 	ps.player.WeaponFrame = ps.weaponFrame
@@ -595,4 +730,6 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 			Yaw:    mn.Yaw,
 		})
 	}
+
+	buildParticleItems(ps)
 }

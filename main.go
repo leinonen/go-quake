@@ -57,6 +57,12 @@ var hudVertSrc string
 //go:embed renderer/shaders/hud.frag.glsl
 var hudFragSrc string
 
+//go:embed renderer/shaders/particle.vert.glsl
+var partVertSrc string
+
+//go:embed renderer/shaders/particle.frag.glsl
+var partFragSrc string
+
 const eyeHeight = 22.0
 
 func main() {
@@ -248,6 +254,7 @@ func main() {
 		skyVertSrc, skyFragSrc,
 		weapVertSrc, weapFragSrc,
 		hudVertSrc, hudFragSrc,
+		partVertSrc, partFragSrc,
 		palette, weaponFrames, itemModels)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)

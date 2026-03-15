@@ -54,6 +54,8 @@ renderer/
     weapon.frag.glsl   — skin texture with grey desaturation + ambient dim to match world look
     hud.vert.glsl      — emits NDC quad vertices, passes vUV across bar width
     hud.frag.glsl      — health bar: discards pixels where vUV.x > uFrac; colour transitions green→red
+    particle.vert.glsl — GL_POINTS with depth-scaled point size (2–16px); passes vLife, vStuck
+    particle.frag.glsl — circular disc via gl_PointCoord; fresh red → dried dark red; alpha = edge * vLife
 physics/
   physics.go         — WASD + mouselook, gravity, jumping, BSP collision, weapon swing, monster AI; own goroutine
 input/
@@ -124,7 +126,7 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 
 `progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. All animation frames are built into separate VAOs (interleaved `x,y,z,u,v`, 5 floats per vertex, no index buffer). The skin texture is uploaded once and shared across frames.
 
-Draw order: world → brush entities → skybox → **weapon** (depth cleared before weapon draw) → **HUD**.
+Draw order: world → brush entities → items/monsters → skybox → **particles** (blend on, depth write off) → (depth clear) → **weapon** → **HUD**.
 
 The weapon is positioned in GL camera space via:
 - `RotX(-90) * RotZ(90)` — converts Quake view space (X=forward, -Y=right, Z=up) to GL camera space (-Z=forward, +X=right, +Y=up)
@@ -194,6 +196,24 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.
 - Player respawn: death teleports back to spawn with full HP and reset monster alert state.
 - HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
+- Blood particles: axe hits spray ~80 physics-simulated GL_POINTS in a wide cone; pool of 2048; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
+
+## blood particle system
+
+Pool of 2048 `particle` structs owned by the physics goroutine (`physics/physics.go`). Each tick, `tickParticles` runs:
+- **Life decay:** `Life -= dt`; deactivate when `Life ≤ 0`
+- **Flying:** gravity applied (`Vel[2] -= 800*dt`), then `HullTrace` against world point hull
+  - Hit → `Pos = tr.EndPos`, zero velocity, `Stuck = true`, clamp `Life = min(Life, 7s)`
+  - `StartSolid` → mark stuck immediately
+  - No hit → advance `Pos`
+- **Stuck:** no movement; just fade
+
+`emitBloodParticles` is called from `tryAxeHit` on each monster hit:
+- Scans `particles[]` from `nextFreeHint` (amortised cursor) for free slots
+- Sprays `particleEmitCount=80` particles with random cone spread (`particleSpread=1.4`) around the forward vector
+- Speed: `350 * rand(0.5..1.0)` units/s
+
+Live particles flow to the renderer via `PlayerState.Particles []ParticleState` (normalised life + stuck flag). Renderer packs 5 floats per particle (x,y,z,life,stuck) into a dynamic VBO each frame.
 
 ## current limitations / next steps
 

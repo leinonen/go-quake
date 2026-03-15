@@ -16,6 +16,13 @@ type EntityState struct {
 	Offset     [3]float32
 }
 
+// ParticleState carries the world position and lifetime for one blood particle.
+type ParticleState struct {
+	Pos   [3]float32
+	Life  float32 // normalised 0..1 remaining lifetime (for alpha fade)
+	Stuck bool
+}
+
 // PlayerState is the authoritative player position/orientation sent from physics to coordinator.
 type PlayerState struct {
 	Position     mgl32.Vec3
@@ -26,7 +33,8 @@ type PlayerState struct {
 	Entities     []EntityState
 	Health       int
 	WeaponFrame  int
-	MonsterItems []ItemState // live monster positions + frame indices (set by physics)
+	MonsterItems []ItemState     // live monster positions + frame indices (set by physics)
+	Particles    []ParticleState // live blood particles (set by physics)
 }
 
 // ItemState carries the world position, mesh index, animation frame, and facing yaw for one item or monster.

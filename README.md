@@ -45,6 +45,7 @@ go run . -map /path/to/e1m1.bsp
 - **View weapon** — `v_axe.mdl` rendered in camera space with full swing animation
 - **Item pickup** — weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP
 - **Monster AI** — all 15 Quake monster types animate, alert on line-of-sight, chase, and melee attack; blocked by closed doors; subject to gravity
+- **Blood particles** — axe hits spray ~80 physics-simulated particles in a wide cone; particles arc with gravity, splat on walls and floors, then fade out
 - **Combat** — left-click swings the axe; hit detection fires at frame 2 of the swing; monsters have 30 HP and die permanently
 - **Player health** — starts at 100 HP; monsters deal 10 damage per hit; health bar at screen bottom; death teleports back to spawn
 - **Respawn** — on death the player resets to spawn, HP restores to 100, and all monsters un-alert

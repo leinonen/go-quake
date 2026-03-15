@@ -93,6 +93,13 @@ type Renderer struct {
 	hudVAO     uint32
 	hudFracLoc int32
 
+	// blood particles
+	particleProg    uint32
+	particleVAO     uint32
+	particleVBO     uint32
+	partMVPLoc      int32
+	particleScratch []float32 // reused each frame
+
 	startTime  time.Time
 	entityVAOs []entityRenderable
 	itemVAOs   []itemRenderable
@@ -128,7 +135,8 @@ func Init(m *bsp.Map,
 	vertSrc, fragSrc, computeSrc,
 	skyVertSrc, skyFragSrc,
 	weapVertSrc, weapFragSrc,
-	hudVertSrc, hudFragSrc string,
+	hudVertSrc, hudFragSrc,
+	partVertSrc, partFragSrc string,
 	palette []byte,
 	weapon []*WeaponMesh,
 	items []ItemModel) (*Renderer, error) {
@@ -370,6 +378,35 @@ func Init(m *bsp.Map,
 		gl.BindVertexArray(0)
 	}
 
+	// Particle shader + dynamic VBO (512 particles × 5 floats × 4 bytes)
+	if len(partVertSrc) > 0 && len(partFragSrc) > 0 {
+		pp, err := compileRender(partVertSrc, partFragSrc)
+		if err != nil {
+			return nil, fmt.Errorf("compile particle shaders: %w", err)
+		}
+		r.particleProg = pp
+		r.partMVPLoc = gl.GetUniformLocation(pp, gl.Str("uMVP\x00"))
+
+		gl.GenVertexArrays(1, &r.particleVAO)
+		gl.BindVertexArray(r.particleVAO)
+		gl.GenBuffers(1, &r.particleVBO)
+		gl.BindBuffer(gl.ARRAY_BUFFER, r.particleVBO)
+		gl.BufferData(gl.ARRAY_BUFFER, 2048*5*4, nil, gl.DYNAMIC_DRAW)
+		// aPos: 3 floats at offset 0
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
+		// aLife: 1 float at offset 12
+		gl.EnableVertexAttribArray(1)
+		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 20, 12)
+		// aStuck: 1 float at offset 16
+		gl.EnableVertexAttribArray(2)
+		gl.VertexAttribPointerWithOffset(2, 1, gl.FLOAT, false, 20, 16)
+		gl.BindVertexArray(0)
+
+		gl.Enable(gl.PROGRAM_POINT_SIZE)
+		r.particleScratch = make([]float32, 0, 2048*5)
+	}
+
 	return r, nil
 }
 
@@ -486,6 +523,37 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.BindVertexArray(0)
 	gl.Enable(gl.CULL_FACE)
 	gl.DepthFunc(gl.LESS)
+
+	// Draw blood particles — alpha blended, depth write off.
+	if r.particleProg != 0 && len(frame.Player.Particles) > 0 {
+		r.particleScratch = r.particleScratch[:0]
+		for _, p := range frame.Player.Particles {
+			stuck := float32(0)
+			if p.Stuck {
+				stuck = 1
+			}
+			r.particleScratch = append(r.particleScratch, p.Pos[0], p.Pos[1], p.Pos[2], p.Life, stuck)
+		}
+		n := int32(len(frame.Player.Particles))
+		gl.BindBuffer(gl.ARRAY_BUFFER, r.particleVBO)
+		gl.BufferSubData(gl.ARRAY_BUFFER, 0, int(n)*20, unsafe.Pointer(&r.particleScratch[0]))
+		gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+
+		gl.Enable(gl.BLEND)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+		gl.DepthMask(false)
+		gl.Disable(gl.CULL_FACE)
+
+		gl.UseProgram(r.particleProg)
+		gl.UniformMatrix4fv(r.partMVPLoc, 1, false, &mvp[0])
+		gl.BindVertexArray(r.particleVAO)
+		gl.DrawArrays(gl.POINTS, 0, n)
+		gl.BindVertexArray(0)
+
+		gl.DepthMask(true)
+		gl.Disable(gl.BLEND)
+		gl.Enable(gl.CULL_FACE)
+	}
 
 	// Draw view weapon on top of everything — clear depth so it is never
 	// occluded by world geometry.

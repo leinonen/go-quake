@@ -65,6 +65,7 @@ input (main thread) → bus.Input → physics goroutine → bus.Physics → main
 
 - `bus.Input` unbuffered — honest backpressure on physics
 - `bus.Physics` / `bus.Render` buffered 1 — stale states are dropped, never queued
+- `bus.ItemPickups` buffered 16 — physics sends item indices on pickup; main drains each frame
 - `bus.Shutdown` closed to broadcast stop to all goroutines
 - GL must stay on the OS main thread (`runtime.LockOSThread` in `init()`)
 
@@ -127,6 +128,19 @@ The weapon is positioned in GL camera space via:
 
 The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mix(color, luma, 0.4)`) plus a fixed 0.72 ambient dim (no BSP lightmap for MDL models). If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
 
+## item pickup system
+
+Item spawns (weapons, armor, ammo, health, keys) are loaded from the BSP entity lump at startup into `itemSpawns []entities.ItemSpawn` and `itemStates []game.ItemState`. Monsters use the same `itemStates` slice but are appended after items (`numItems = len(itemSpawns)`).
+
+**Pickup detection** runs in the physics goroutine:
+- After each movement tick, the player foot origin (`position − eyeHeight`) is checked against each unpicked item
+- Radius: 32 units (Quake standard)
+- On contact: index sent on `bus.ItemPickups` (non-blocking); `picked[i] = true` prevents double-pickup
+
+**Main loop** drains `bus.ItemPickups` each frame using a labeled `break` loop, marks `pickedItems[idx] = true`, then builds `visibleItems` by filtering out picked indices below `numItems`. Monster entries (`i >= numItems`) are always included.
+
+**Single-player rules**: no respawn. Items are gone permanently once picked.
+
 ## special features
 
 - Compute shader PVS: GLQuake's portal/PVS visibility approach executed on the GPU as compute — not rasterization, not raytracing. Unusual middle ground.
@@ -135,7 +149,8 @@ The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mi
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
 - View weapon: `v_axe.mdl` rendered in camera space with matching grey aesthetic.
-- Item and monster rendering: weapons, armor, ammo, health, keys, and all 15 monster types parsed from entity lump and rendered as MDL/BSP models at world positions.
+- Item pickup: weapons, armor, ammo, health, and keys disappear on contact (32-unit sphere against player foot origin, single-player rules — no respawn). Pickup detection runs in the physics goroutine; events flow through `bus.ItemPickups` (buffered 16) to the main loop which filters the visible item list each frame.
+- Monster rendering: all 15 Quake monster types parsed from entity lump and rendered as static MDL models at spawn positions.
 
 ## current limitations / next steps
 
@@ -144,5 +159,6 @@ The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mi
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
 - BSP lightmap brightness computed (`bsp/lighting.go`) but not yet wired into the renderer SSBO
 - Weapon renders frame 0 only — no swing animation, no view bob
-- Monsters render frame 0 only — no AI, no animation, no collision
-- Items and monsters render at fixed spawn positions — no pickup logic, no respawn
+- Monsters render frame 0 only — no AI, no animation, no collision, no death
+- Items render at spawn positions until touched; no respawn (single-player rules)
+- Monsters render at fixed spawn positions — no AI, no animation, no collision, no death

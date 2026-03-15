@@ -41,7 +41,7 @@ go run . -map /path/to/e1m1.bsp
 - **Procedural skybox** — FBM cloud layers replace Quake sky polygons; no seams from any angle
 - **Procedural water** — sin-warp turbulence + caustic glints replace Quake water textures
 - **View weapon** — `v_axe.mdl` parsed from the PAK and rendered in camera space
-- **Item entities** — weapons, armor, ammo, health, and keys parsed and rendered at their world positions
+- **Item pickup** — weapons, armor, ammo, health, and keys disappear on contact (32-unit radius, single-player rules)
 - **Monster entities** — all 15 Quake monster types parsed and rendered as static MDL models at spawn positions
 
 ## License

@@ -63,6 +63,7 @@ func main() {
 	var weapon *renderer.WeaponMesh
 	var itemMeshes [][]*renderer.WeaponMesh
 	var itemStates []game.ItemState
+	var itemSpawns []entities.ItemSpawn // item-only spawns (not monsters) for pickup detection
 
 	switch {
 	case *pakPath != "":
@@ -128,7 +129,7 @@ func main() {
 		}
 
 		// Load item models (MDL or BSP sub-model) referenced by the map entity lump.
-		itemSpawns := entities.ParseItems(m.Entities)
+		itemSpawns = entities.ParseItems(m.Entities)
 		modelPathToIdx := map[string]int{}
 		for _, sp := range itemSpawns {
 			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
@@ -283,9 +284,11 @@ func main() {
 	log.Printf("brush entities: %d (func_door/func_plat)", len(mgr.Entities))
 
 	bus := game.NewBus()
-	go physics.Run(m, mgr, bus, spawn)
+	go physics.Run(m, mgr, bus, spawn, itemSpawns)
 
 	playerState := game.PlayerState{Position: spawn}
+	pickedItems := make([]bool, len(itemSpawns))
+	numItems := len(itemSpawns)
 
 	var screenshotRequested bool
 	win.SetKeyCallback(func(w *glfw.Window, key glfw.Key, _ int, action glfw.Action, _ glfw.ModifierKey) {
@@ -331,10 +334,32 @@ func main() {
 		default:
 		}
 
+		// Drain item pickup events from physics.
+	drainPickups:
+		for {
+			select {
+			case idx := <-bus.ItemPickups:
+				if idx >= 0 && idx < numItems {
+					pickedItems[idx] = true
+				}
+			default:
+				break drainPickups
+			}
+		}
+
+		// Build visible item list (exclude picked items; monsters always shown).
+		visibleItems := itemStates[:0:0]
+		for i, is := range itemStates {
+			if i < numItems && pickedItems[i] {
+				continue
+			}
+			visibleItems = append(visibleItems, is)
+		}
+
 		w, h := win.GetFramebufferSize()
 		gl.Viewport(0, 0, int32(w), int32(h))
 
-		rend.Draw(game.RenderFrame{Player: playerState, Items: itemStates}, w, h)
+		rend.Draw(game.RenderFrame{Player: playerState, Items: visibleItems}, w, h)
 
 		if screenshotRequested {
 			screenshotRequested = false

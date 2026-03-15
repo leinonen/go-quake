@@ -12,15 +12,16 @@ import (
 )
 
 const (
-	mouseSens = 0.15
-	moveSpeed = 320.0 // units/s, classic Quake speed
-	eyeHeight = 22.0  // view height above player origin (Quake DEFAULT_VIEWHEIGHT)
-	gravity   = 800.0 // units/s^2
-	jumpSpeed = 270.0 // initial Z velocity on jump
+	mouseSens    = 0.15
+	moveSpeed    = 320.0 // units/s, classic Quake speed
+	eyeHeight    = 22.0  // view height above player origin (Quake DEFAULT_VIEWHEIGHT)
+	gravity      = 800.0 // units/s^2
+	jumpSpeed    = 270.0 // initial Z velocity on jump
+	pickupRadius = 32.0  // item touch radius (Quake standard)
 )
 
 // Run is the physics goroutine. It receives input events and emits player states.
-func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3) {
+func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3, items []entities.ItemSpawn) {
 	state := game.PlayerState{
 		Position: spawn,
 		Yaw:      0,
@@ -28,12 +29,37 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3) {
 	}
 	state.LeafIndex = vis.LeafForPoint(m, [3]float32(state.Position))
 
+	picked := make([]bool, len(items))
+
 	for {
 		select {
 		case <-bus.Shutdown:
 			return
 		case ev := <-bus.Input:
 			state = tick(m, mgr, state, ev)
+
+			// Check item pickups against player foot origin.
+			origin := [3]float32{
+				state.Position[0],
+				state.Position[1],
+				state.Position[2] - eyeHeight,
+			}
+			for i, item := range items {
+				if picked[i] {
+					continue
+				}
+				dx := origin[0] - item.Pos[0]
+				dy := origin[1] - item.Pos[1]
+				dz := origin[2] - item.Pos[2]
+				if dx*dx+dy*dy+dz*dz < pickupRadius*pickupRadius {
+					picked[i] = true
+					select {
+					case bus.ItemPickups <- i:
+					default:
+					}
+				}
+			}
+
 			// Non-blocking send to coordinator
 			select {
 			case bus.Physics <- state:

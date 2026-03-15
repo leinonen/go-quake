@@ -37,7 +37,7 @@ vis/
   vis.go             — PVS RLE decompress, IsLeafVisible, LeafForPoint
 entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
-  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models)
+  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models); ParseMonsters, MonsterPath: maps monster_* classnames to MDL paths
 mdl/
   mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts, SkinRGB
 renderer/
@@ -135,13 +135,14 @@ The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mi
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
 - View weapon: `v_axe.mdl` rendered in camera space with matching grey aesthetic.
+- Item and monster rendering: weapons, armor, ammo, health, keys, and all 15 monster types parsed from entity lump and rendered as MDL/BSP models at world positions.
 
 ## current limitations / next steps
 
 - `CountVisible()` does a GPU→CPU readback every 30 frames (debug only); replace with `glMultiDrawArraysIndirect` for fully GPU-resident pipeline
 - No sound
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
-- Item entities parsed (`entities/items.go`) but not yet rendered — groundwork for weapons/armor/ammo/health on the floor
 - BSP lightmap brightness computed (`bsp/lighting.go`) but not yet wired into the renderer SSBO
 - Weapon renders frame 0 only — no swing animation, no view bob
-- No monster entities
+- Monsters render frame 0 only — no AI, no animation, no collision
+- Items and monsters render at fixed spawn positions — no pickup logic, no respawn

@@ -183,6 +183,40 @@ func main() {
 		}
 		log.Printf("items: %d spawns, %d unique models", len(itemStates), len(itemMeshes))
 
+		// Load monster MDL models from entity lump.
+		monsterSpawns := entities.ParseMonsters(m.Entities)
+		for _, sp := range monsterSpawns {
+			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
+				modelPathToIdx[sp.ModelPath] = len(itemMeshes)
+				var groups []*renderer.WeaponMesh
+				if mdata, merr := p.ReadFile(sp.ModelPath); merr == nil {
+					if mmdl, merr := mdl.Load(mdata); merr == nil {
+						verts := mmdl.BuildVerts(0)
+						texRGB := mmdl.SkinRGB(0, palette)
+						if len(verts) > 0 && len(texRGB) > 0 {
+							groups = []*renderer.WeaponMesh{{
+								Verts:  verts,
+								TexRGB: texRGB,
+								TexW:   mmdl.SkinWidth,
+								TexH:   mmdl.SkinHeight,
+							}}
+							log.Printf("monster MDL loaded: %s (%d tris)", sp.ModelPath, len(verts)/15)
+						}
+					} else {
+						log.Printf("monster MDL parse failed: %s: %v", sp.ModelPath, merr)
+					}
+				} else {
+					log.Printf("monster MDL not in PAK: %s", sp.ModelPath)
+				}
+				itemMeshes = append(itemMeshes, groups)
+			}
+			itemStates = append(itemStates, game.ItemState{
+				Pos:    sp.Pos,
+				MdlIdx: modelPathToIdx[sp.ModelPath],
+			})
+		}
+		log.Printf("monsters: %d spawns, %d unique models", len(monsterSpawns), len(modelPathToIdx))
+
 	case *mapName != "":
 		// Direct .bsp file
 		var err error

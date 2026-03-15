@@ -30,6 +30,60 @@ func ParseItems(entityLump string) []ItemSpawn {
 	return out
 }
 
+// MonsterPath returns the PAK MDL path for a monster classname, or "" if unknown.
+func MonsterPath(classname string) string {
+	switch classname {
+	case "monster_army":
+		return "progs/soldier.mdl"
+	case "monster_enforcer":
+		return "progs/enforcer.mdl"
+	case "monster_ogre":
+		return "progs/ogre.mdl"
+	case "monster_demon1":
+		return "progs/demon.mdl"
+	case "monster_shambler":
+		return "progs/shambler.mdl"
+	case "monster_knight":
+		return "progs/knight.mdl"
+	case "monster_zombie":
+		return "progs/zombie.mdl"
+	case "monster_dog":
+		return "progs/dog.mdl"
+	case "monster_hell_knight":
+		return "progs/hknight.mdl"
+	case "monster_scrag":
+		return "progs/wizard.mdl"
+	case "monster_tarbaby":
+		return "progs/tarbaby.mdl"
+	case "monster_fish":
+		return "progs/fish.mdl"
+	case "monster_shalrath":
+		return "progs/shalrath.mdl"
+	case "monster_boss":
+		return "progs/boss.mdl"
+	case "monster_oldone":
+		return "progs/oldone.mdl"
+	}
+	return ""
+}
+
+// ParseMonsters returns all monster spawns from a BSP entity lump.
+func ParseMonsters(entityLump string) []ItemSpawn {
+	var out []ItemSpawn
+	for _, e := range bsp.ParseEntities(entityLump) {
+		path := MonsterPath(e.Fields["classname"])
+		if path == "" {
+			continue
+		}
+		pos, err := bsp.ParseVec3(e.Fields["origin"])
+		if err != nil {
+			continue
+		}
+		out = append(out, ItemSpawn{Pos: pos, ModelPath: path})
+	}
+	return out
+}
+
 // ItemPath returns the PAK model path for a BSP entity, or "" if not a renderable item.
 func ItemPath(e bsp.Entity) string {
 	flags, _ := strconv.Atoi(e.Fields["spawnflags"])

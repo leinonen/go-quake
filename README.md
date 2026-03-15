@@ -2,7 +2,7 @@
 
 Minimalistic Quake 1 engine written in Go. Loads real BSP29 maps and renders them with a compute shader PVS pipeline.
 
-![screenshot](./docs/screenshot_20260314_100833.png)
+![screenshot](./docs/screenshot_20260315_153352.png)
 
 ## Requirements
 
@@ -37,6 +37,7 @@ go run . -map /path/to/e1m1.bsp
 ## Features
 
 - **Compute shader PVS** — Quake's portal visibility executed on the GPU; invisible faces are discarded before rasterization
+- **Lightmap atlas** — all per-face baked lightmaps packed into a GPU atlas texture; sampled per-pixel for smooth spatial lighting gradients matching GLQuake
 - **Goroutine architecture** — input, physics, and rendering run as separate goroutines communicating over typed channels; vsync is the only throttle
 - **BSP collision** — hull tracing against the world and brush entities (func_door, func_plat)
 - **Interactive doors and elevators** — proximity-triggered state machines with full collision

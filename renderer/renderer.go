@@ -77,6 +77,7 @@ type Renderer struct {
 	ssboFaceAtlas    uint32
 	atlasTexture     uint32
 	atlasW, atlasH   int32
+	lightmapTexture  uint32
 
 	mvpLoc          int32
 	usePVSLoc       int32
@@ -85,6 +86,7 @@ type Renderer struct {
 	atlasSizeLoc    int32
 	entityOffsetLoc int32
 	timeLoc         int32
+	lightmapLoc     int32
 
 	skyProg    uint32
 	skyVAO     uint32
@@ -168,6 +170,7 @@ func Init(m *bsp.Map,
 	r.atlasSizeLoc = gl.GetUniformLocation(prog, gl.Str("uAtlasSize\x00"))
 	r.entityOffsetLoc = gl.GetUniformLocation(prog, gl.Str("uEntityOffset\x00"))
 	r.timeLoc = gl.GetUniformLocation(prog, gl.Str("uTime\x00"))
+	r.lightmapLoc = gl.GetUniformLocation(prog, gl.Str("uLightmap\x00"))
 	r.startTime = time.Now()
 
 	// Skybox shader
@@ -206,9 +209,21 @@ func Init(m *bsp.Map,
 	// Per-face atlas info SSBO (binding 5)
 	r.ssboFaceAtlas = buildFaceAtlasSSBO(m, rects)
 
-	// Build vertex buffer from BSP faces (6 floats per vertex: x,y,z, faceIdx, s, t)
-	verts := buildModelVerts(m, 0)
-	r.numVerts = int32(len(verts) / 6)
+	// Build lightmap atlas and upload as TEXTURE1
+	lmPixels, lmW, lmH, lmInfos := bsp.BuildLightmapAtlas(m)
+	gl.GenTextures(1, &r.lightmapTexture)
+	gl.BindTexture(gl.TEXTURE_2D, r.lightmapTexture)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(lmW), int32(lmH), 0,
+		gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&lmPixels[0]))
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+	gl.BindTexture(gl.TEXTURE_2D, 0)
+
+	// Build vertex buffer from BSP faces (8 floats per vertex: x,y,z, faceIdx, s, t, lmU, lmV)
+	verts := buildModelVerts(m, 0, lmInfos, lmW, lmH)
+	r.numVerts = int32(len(verts) / 8)
 
 	gl.GenVertexArrays(1, &r.vao)
 	gl.BindVertexArray(r.vao)
@@ -216,16 +231,18 @@ func Init(m *bsp.Map,
 	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
 	gl.BufferData(gl.ARRAY_BUFFER, len(verts)*4, unsafe.Pointer(&verts[0]), gl.STATIC_DRAW)
 	gl.EnableVertexAttribArray(0)
-	gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 24, 0)
+	gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 32, 0)
 	gl.EnableVertexAttribArray(1)
-	gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 24, 12)
+	gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 32, 12)
 	gl.EnableVertexAttribArray(2)
-	gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 24, 16)
+	gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 32, 16)
+	gl.EnableVertexAttribArray(3)
+	gl.VertexAttribPointerWithOffset(3, 2, gl.FLOAT, false, 32, 24)
 	gl.BindVertexArray(0)
 
 	// Build VAOs for brush entity sub-models (Models[1..N])
 	for i := 1; i < len(m.Models); i++ {
-		ev := buildModelVerts(m, i)
+		ev := buildModelVerts(m, i, lmInfos, lmW, lmH)
 		if len(ev) == 0 {
 			r.entityVAOs = append(r.entityVAOs, entityRenderable{})
 			continue
@@ -237,13 +254,15 @@ func Init(m *bsp.Map,
 		gl.BindBuffer(gl.ARRAY_BUFFER, evbo)
 		gl.BufferData(gl.ARRAY_BUFFER, len(ev)*4, unsafe.Pointer(&ev[0]), gl.STATIC_DRAW)
 		gl.EnableVertexAttribArray(0)
-		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 24, 0)
+		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 32, 0)
 		gl.EnableVertexAttribArray(1)
-		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 24, 12)
+		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 32, 12)
 		gl.EnableVertexAttribArray(2)
-		gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 24, 16)
+		gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 32, 16)
+		gl.EnableVertexAttribArray(3)
+		gl.VertexAttribPointerWithOffset(3, 2, gl.FLOAT, false, 32, 24)
 		gl.BindVertexArray(0)
-		r.entityVAOs = append(r.entityVAOs, entityRenderable{vao: evao, numVerts: int32(len(ev) / 6)})
+		r.entityVAOs = append(r.entityVAOs, entityRenderable{vao: evao, numVerts: int32(len(ev) / 8)})
 	}
 
 	// Compute shader
@@ -462,6 +481,9 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.BindTexture(gl.TEXTURE_2D, r.atlasTexture)
 	gl.Uniform1i(r.atlasLoc, 0)
 	gl.Uniform2f(r.atlasSizeLoc, float32(r.atlasW), float32(r.atlasH))
+	gl.ActiveTexture(gl.TEXTURE1)
+	gl.BindTexture(gl.TEXTURE_2D, r.lightmapTexture)
+	gl.Uniform1i(r.lightmapLoc, 1)
 
 	// Draw world (PVS on, no entity offset)
 	gl.Uniform3f(r.entityOffsetLoc, 0, 0, 0)
@@ -645,8 +667,8 @@ func boolToInt32(b bool) int32 {
 }
 
 // buildModelVerts triangulates BSP faces for the given model index into a flat float32 slice.
-// Each vertex: x, y, z, faceIndex, s, t (6 floats; s/t are raw pixel-space texture coords).
-func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
+// Each vertex: x, y, z, faceIndex, s, t, lmU, lmV (8 floats; s/t are raw pixel-space texture coords).
+func buildModelVerts(m *bsp.Map, modelIdx int, lmInfos []bsp.LightmapFaceInfo, lmW, lmH int) []float32 {
 	if modelIdx < 0 || modelIdx >= len(m.Models) {
 		return nil
 	}
@@ -666,6 +688,11 @@ func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
 			tv = ti.Vecs[1]
 		}
 
+		var info bsp.LightmapFaceInfo
+		if faceIdx < len(lmInfos) {
+			info = lmInfos[faceIdx]
+		}
+
 		faceVs := make([][3]float32, 0, face.NumEdges)
 		for i := 0; i < int(face.NumEdges); i++ {
 			seIdx := int(face.FirstEdge) + i
@@ -682,7 +709,12 @@ func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
 			for _, vtx := range [][3]float32{faceVs[0], faceVs[i], faceVs[i+1]} {
 				s := vtx[0]*sv[0] + vtx[1]*sv[1] + vtx[2]*sv[2] + sv[3]
 				t := vtx[0]*tv[0] + vtx[1]*tv[1] + vtx[2]*tv[2] + tv[3]
-				verts = append(verts, vtx[0], vtx[1], vtx[2], fi, s, t)
+				// Lightmap UV: map texel-space s/t into atlas-normalized coords.
+				ls := (s - info.MinS) / 16.0
+				lt := (t - info.MinT) / 16.0
+				lmU := (float32(info.AtlasX) + 0.5 + ls) / float32(lmW)
+				lmV := (float32(info.AtlasY) + 0.5 + lt) / float32(lmH)
+				verts = append(verts, vtx[0], vtx[1], vtx[2], fi, s, t, lmU, lmV)
 			}
 		}
 	}

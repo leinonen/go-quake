@@ -30,7 +30,7 @@ bsp/
   loader.go          — parses BSP from file path or []byte (for PAK extraction)
   entities.go        — entity lump parser: ParseEntities, ParseVec3, ParseFloat, MoveDir
   clip.go            — BSP hull tracing (HullTrace, HullPointContents)
-  lighting.go        — FaceBrightness: per-face lightmap average (0–1) + sky/water sentinels (2.0/3.0)
+  lighting.go        — FaceBrightness: per-face lightmap average (0–1) + sky/water sentinels (2.0/3.0); BuildLightmapAtlas: shelf-packs all face lightmaps into a 2048×N RGB atlas (BSP29 = 1 byte/texel grayscale, replicated to RGB)
 pak/
   pak.go             — reads id Software PAK archives; FindMaps(), ReadFile()
 vis/
@@ -46,8 +46,8 @@ renderer/
   compute.go         — SSBO lifecycle, per-frame dispatch + barrier
   shaders/
     pvs_traverse.glsl  — compute shader: Quake RLE PVS decode on GPU, sets visibleFaceFlags[]
-    world.vert.glsl    — perspective projection + uEntityOffset for brush entity rendering
-    world.frag.glsl    — per-face texture from atlas; sky faces discard; water faces procedural; discards invisible faces
+    world.vert.glsl    — perspective projection + uEntityOffset for brush entity rendering; passes lightmap UV (aLightmapST) to fragment stage
+    world.frag.glsl    — per-face texture from atlas; lightmap sampled from uLightmap atlas (overbright ×2); sky faces discard; water faces procedural; discards invisible faces
     skybox.vert.glsl   — passes cube vertex as vDir; sets gl_Position.z = w (depth = 1.0)
     skybox.frag.glsl   — procedural ominous sky: direction-based FBM clouds, horizon ember glow
     weapon.vert.glsl   — view-space weapon transform: uProj * uWeaponMat * aPos; also used for world items/monsters
@@ -122,6 +122,19 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 - Foam-edge highlight where the two wave systems clash (`abs(w1 - w2)`)
 - Animated via `uTime` uniform (elapsed seconds since renderer init)
 
+## lightmap atlas
+
+BSP29 lightmaps are 1 byte per texel (grayscale luminance). `BuildLightmapAtlas` in `bsp/lighting.go` shelf-packs all face lightmaps into a single `2048×N` RGB texture (grayscale replicated to all 3 channels):
+
+- Faces without valid lightmap data (sky/water sentinels, `LightOfs < 0`, out-of-bounds) map to a `128,128,128` fallback texel at `(0,0)`; `×2.0` in the shader = full brightness
+- Shelf-pack cursor starts at `x=2` to reserve `(0,0)` for the fallback; each shelf row adds 1-texel padding on all sides to prevent bleeding under bilinear filtering
+- `LightmapFaceInfo` stores `AtlasX/Y` (inside padding), `W/H`, and `MinS/MinT` (lightmap-space origin in texel units × 16)
+- Per-vertex lightmap UVs computed in `buildModelVerts`: `lmU = (AtlasX + 0.5 + (s − MinS)/16) / atlasW`
+- Uploaded as `GL_TEXTURE1` with `GL_LINEAR` + `GL_CLAMP_TO_EDGE`; world and entity draw passes bind it before drawing
+- Fragment shader: `color * texture(uLightmap, vLightmapST).rgb * 2.0` (Quake overbright factor)
+- Vertex format: 8 floats per vertex (`x,y,z, faceIdx, s,t, lmU,lmV`), stride 32; lightmap UV is attribute location 3
+- `FaceBrightness` SSBO (binding 4) is retained; the fragment shader still reads it for sky/water sentinel branching only
+
 ## view weapon rendering
 
 `progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. All animation frames are built into separate VAOs (interleaved `x,y,z,u,v`, 5 floats per vertex, no index buffer). The skin texture is uploaded once and shared across frames.
@@ -187,6 +200,7 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 ## special features
 
 - Compute shader PVS: GLQuake's portal/PVS visibility approach executed on the GPU as compute — not rasterization, not raytracing. Unusual middle ground.
+- Lightmap atlas: all per-face baked lightmaps (BSP29 grayscale, 1 byte/texel) shelf-packed into a GPU atlas texture and sampled per-pixel; produces smooth spatial lighting gradients as Quake intended.
 - Emergent game loop: no central tick. Input, physics, and rendering are goroutines communicating via typed channels. Vsync (`SwapInterval(1)`) is the only throttle.
 - Interactive doors and elevators: proximity-triggered state machines with BSP hull collision.
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
@@ -220,7 +234,6 @@ Live particles flow to the renderer via `PlayerState.Particles []ParticleState` 
 - `CountVisible()` does a GPU→CPU readback every 30 frames (debug only); replace with `glMultiDrawArraysIndirect` for fully GPU-resident pipeline
 - No sound
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
-- BSP lightmap brightness computed (`bsp/lighting.go`) but not yet wired into the renderer SSBO
 - No view bob or weapon kick animation
 - Monster AI is purely melee — no ranged attacks, no projectiles
 - Monsters have no death animation (disappear instantly on HP ≤ 0)

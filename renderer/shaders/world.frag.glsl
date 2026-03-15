@@ -2,6 +2,7 @@
 
 flat in uint vFaceIndex;
 in vec2 vTexST;
+in vec2 vLightmapST;
 in float vEyeDist;
 
 // SSBO 3: visible face flags (same binding as compute shader)
@@ -23,6 +24,7 @@ uniform bool uUsePVS;
 uniform uint uTotalFaces;
 uniform sampler2D uAtlas;
 uniform vec2 uAtlasSize;
+uniform sampler2D uLightmap;
 uniform float uTime;
 
 out vec4 fragColor;
@@ -121,13 +123,8 @@ void main() {
     float luma = dot(color, vec3(0.299, 0.587, 0.114));
     color = mix(color, vec3(luma), 0.4);
 
-    // Apply lightmap brightness
-    float lightFactor;
-    if (b >= 1.5) {
-        lightFactor = 1.0; // water: no lightmap dimming
-    } else {
-        lightFactor = pow(b, 0.75); // mild gamma lift for linear lightmaps
-    }
+    // Per-texel lightmap (Quake overbright: stored at half intensity, *2 restores range)
+    vec3 lm = texture(uLightmap, vLightmapST).rgb;
 
     // Exponential fog (greyish)
     const vec3 fogColor = vec3(0.12, 0.12, 0.13);
@@ -135,6 +132,6 @@ void main() {
     float fogFactor = exp(-fogDensity * vEyeDist);
     fogFactor = clamp(fogFactor, 0.0, 1.0);
 
-    vec3 finalColor = mix(fogColor, color * lightFactor, fogFactor);
+    vec3 finalColor = mix(fogColor, color * lm * 2.0, fogFactor);
     fragColor = vec4(finalColor, 1.0);
 }

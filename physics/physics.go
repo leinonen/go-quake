@@ -18,16 +18,38 @@ const (
 	gravity      = 800.0 // units/s^2
 	jumpSpeed    = 270.0 // initial Z velocity on jump
 	pickupRadius = 32.0  // item touch radius (Quake standard)
+	weaponFPS    = 8.0   // weapon animation frames per second
+	weaponHitFrame = 2   // axe MDL frame index at which hit detection fires
 )
 
+// physicsState holds all mutable physics state between ticks.
+type physicsState struct {
+	player         game.PlayerState
+	playerHP       int
+	respawnPos     mgl32.Vec3
+	weaponFrame    int
+	weaponFrameTime float32
+	weaponSwinging  bool
+	hitFired        bool
+	weaponNumFrames int
+	monsters        []entities.MonsterState
+}
+
 // Run is the physics goroutine. It receives input events and emits player states.
-func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3, items []entities.ItemSpawn) {
-	state := game.PlayerState{
-		Position: spawn,
-		Yaw:      0,
-		Pitch:    0,
+func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
+	items []entities.ItemSpawn, monsters []entities.MonsterState, numWeaponFrames int) {
+
+	ps := &physicsState{
+		player: game.PlayerState{
+			Position: spawn,
+			Health:   100,
+		},
+		playerHP:        100,
+		respawnPos:      spawn,
+		weaponNumFrames: numWeaponFrames,
+		monsters:        monsters,
 	}
-	state.LeafIndex = vis.LeafForPoint(m, [3]float32(state.Position))
+	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
 
 	picked := make([]bool, len(items))
 
@@ -36,13 +58,13 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3, ite
 		case <-bus.Shutdown:
 			return
 		case ev := <-bus.Input:
-			state = tick(m, mgr, state, ev)
+			tick(m, mgr, ps, ev)
 
 			// Check item pickups against player foot origin.
 			origin := [3]float32{
-				state.Position[0],
-				state.Position[1],
-				state.Position[2] - eyeHeight,
+				ps.player.Position[0],
+				ps.player.Position[1],
+				ps.player.Position[2] - eyeHeight,
 			}
 			for i, item := range items {
 				if picked[i] {
@@ -53,6 +75,12 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3, ite
 				dz := origin[2] - item.Pos[2]
 				if dx*dx+dy*dy+dz*dz < pickupRadius*pickupRadius {
 					picked[i] = true
+					if item.HealthValue > 0 {
+						ps.playerHP += item.HealthValue
+						if ps.playerHP > 100 {
+							ps.playerHP = 100
+						}
+					}
 					select {
 					case bus.ItemPickups <- i:
 					default:
@@ -62,49 +90,50 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3, ite
 
 			// Non-blocking send to coordinator
 			select {
-			case bus.Physics <- state:
+			case bus.Physics <- ps.player:
 			default:
 				// Drain stale and replace
 				select {
 				case <-bus.Physics:
 				default:
 				}
-				bus.Physics <- state
+				bus.Physics <- ps.player
 			}
 		}
 	}
 }
 
-func tick(m *bsp.Map, mgr *entities.Manager, s game.PlayerState, ev game.InputEvent) game.PlayerState {
+func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEvent) {
 	// Mouse look
-	s.Yaw -= float32(ev.MouseDX * mouseSens)
-	s.Pitch -= float32(ev.MouseDY * mouseSens)
-	if s.Pitch > 89 {
-		s.Pitch = 89
+	ps.player.Yaw -= float32(ev.MouseDX * mouseSens)
+	ps.player.Pitch -= float32(ev.MouseDY * mouseSens)
+	if ps.player.Pitch > 89 {
+		ps.player.Pitch = 89
 	}
-	if s.Pitch < -89 {
-		s.Pitch = -89
+	if ps.player.Pitch < -89 {
+		ps.player.Pitch = -89
 	}
 
 	dt := float32(ev.Dt)
 	if dt <= 0 {
-		return s
+		return
 	}
 
 	// No clip nodes → noclip fallback
 	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
-		return noclip(m, s, ev, dt)
+		noclip(m, ps, ev, dt)
+		return
 	}
 
 	hull := m.Models[0].HeadNodes[1] // standing player hull
 
 	// Player origin = eye position minus view height
-	origin := [3]float32{s.Position[0], s.Position[1], s.Position[2] - eyeHeight}
+	origin := [3]float32{ps.player.Position[0], ps.player.Position[1], ps.player.Position[2] - eyeHeight}
 
 	// Advance entity state machines before movement
 	mgr.Update(dt, m, origin)
 
-	yaw := float64(mgl32.DegToRad(s.Yaw))
+	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
 	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
 	right := [3]float32{float32(math.Sin(yaw)), float32(-math.Cos(yaw)), 0}
 
@@ -128,40 +157,248 @@ func tick(m *bsp.Map, mgr *entities.Manager, s game.PlayerState, ev game.InputEv
 		wishY += right[1] * spd
 	}
 	// Override horizontal velocity — no momentum in Quake walking
-	s.Velocity[0] = wishX
-	s.Velocity[1] = wishY
+	ps.player.Velocity[0] = wishX
+	ps.player.Velocity[1] = wishY
 
 	// Apply gravity when airborne
-	if !s.OnGround {
-		s.Velocity[2] -= gravity * dt
+	if !ps.player.OnGround {
+		ps.player.Velocity[2] -= gravity * dt
 	}
 
 	// Jump
-	if ev.Keys[glfw.KeySpace] && s.OnGround {
-		s.Velocity[2] = jumpSpeed
-		s.OnGround = false
+	if ev.Keys[glfw.KeySpace] && ps.player.OnGround {
+		ps.player.Velocity[2] = jumpSpeed
+		ps.player.OnGround = false
 	}
 
 	// Slide move
-	disp := [3]float32{s.Velocity[0] * dt, s.Velocity[1] * dt, s.Velocity[2] * dt}
+	disp := [3]float32{ps.player.Velocity[0] * dt, ps.player.Velocity[1] * dt, ps.player.Velocity[2] * dt}
 	newOrigin := slideMove(m, mgr.Entities, hull, origin, disp)
 
 	// Ground check: trace 2 units down from new position
 	groundEnd := [3]float32{newOrigin[0], newOrigin[1], newOrigin[2] - 2}
 	gtr := traceAll(m, mgr.Entities, hull, newOrigin, groundEnd)
 	if gtr.Hit && gtr.Normal[2] > 0.7 {
-		s.OnGround = true
-		s.Velocity[2] = 0
+		ps.player.OnGround = true
+		ps.player.Velocity[2] = 0
 		newOrigin = gtr.EndPos
 	} else {
-		s.OnGround = false
+		ps.player.OnGround = false
 	}
 
-	s.Position = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
-	s.LeafIndex = vis.LeafForPoint(m, [3]float32(s.Position))
-	s.Entities = mgr.States()
+	ps.player.Position = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
+	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+	ps.player.Entities = mgr.States()
 
-	return s
+	// Weapon tick
+	tickWeapon(ps, ev, dt)
+
+	// Monster tick (pass brush entities for door collision)
+	tickMonsters(m, mgr.Entities, ps, dt)
+
+	// Respawn on death
+	if ps.playerHP <= 0 {
+		ps.player.Position = ps.respawnPos
+		ps.player.Velocity = mgl32.Vec3{}
+		ps.player.OnGround = false
+		ps.playerHP = 100
+		ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+		for i := range ps.monsters {
+			ps.monsters[i].Alerted = false
+		}
+	}
+
+	// Publish game state to player state
+	ps.player.Health = ps.playerHP
+	ps.player.WeaponFrame = ps.weaponFrame
+
+	// Build MonsterItems from live monsters
+	ps.player.MonsterItems = ps.player.MonsterItems[:0]
+	for _, mn := range ps.monsters {
+		if mn.Dead {
+			continue
+		}
+		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
+			Pos:    mn.Pos,
+			MdlIdx: mn.MdlIdx,
+			Frame:  mn.FrameIdx,
+		})
+	}
+}
+
+// tickWeapon advances axe animation and fires hit detection.
+func tickWeapon(ps *physicsState, ev game.InputEvent, dt float32) {
+	if ps.weaponNumFrames <= 0 {
+		return
+	}
+
+	// Start a swing on left-click when not already swinging
+	if ev.MouseButtons[0] && !ps.weaponSwinging {
+		ps.weaponSwinging = true
+		ps.weaponFrame = 1
+		ps.weaponFrameTime = 0
+		ps.hitFired = false
+	}
+
+	if !ps.weaponSwinging {
+		return
+	}
+
+	ps.weaponFrameTime += dt * weaponFPS
+	for ps.weaponFrameTime >= 1.0 {
+		ps.weaponFrameTime -= 1.0
+		ps.weaponFrame++
+
+		// Fire hit check
+		if !ps.hitFired && ps.weaponFrame >= weaponHitFrame {
+			ps.hitFired = true
+			tryAxeHit(ps)
+		}
+
+		// Swing completion
+		if ps.weaponFrame >= ps.weaponNumFrames {
+			ps.weaponFrame = 0
+			ps.weaponSwinging = false
+			ps.hitFired = false
+			break
+		}
+	}
+}
+
+// tryAxeHit casts a 64-unit ray from eye and sphere-tests against live monsters.
+func tryAxeHit(ps *physicsState) {
+	eyePos := [3]float32(ps.player.Position)
+	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
+	pitch := float64(mgl32.DegToRad(ps.player.Pitch))
+	fwdX := float32(math.Cos(pitch) * math.Cos(yaw))
+	fwdY := float32(math.Cos(pitch) * math.Sin(yaw))
+	fwdZ := float32(math.Sin(pitch))
+
+	const rayLen = 64.0
+	const hitRadius = 40.0
+	tipX := eyePos[0] + fwdX*rayLen
+	tipY := eyePos[1] + fwdY*rayLen
+	tipZ := eyePos[2] + fwdZ*rayLen
+
+	for i := range ps.monsters {
+		mn := &ps.monsters[i]
+		if mn.Dead {
+			continue
+		}
+		dx := mn.Pos[0] - tipX
+		dy := mn.Pos[1] - tipY
+		dz := mn.Pos[2] - tipZ
+		if dx*dx+dy*dy+dz*dz < hitRadius*hitRadius {
+			mn.HP -= 25
+			if mn.HP <= 0 {
+				mn.Dead = true
+			}
+		}
+	}
+}
+
+// tickMonsters advances monster AI, animation, gravity and collision for one tick.
+func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsState, dt float32) {
+	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
+		return
+	}
+
+	playerFoot := [3]float32{
+		ps.player.Position[0],
+		ps.player.Position[1],
+		ps.player.Position[2] - eyeHeight,
+	}
+	pointHull := m.Models[0].HeadNodes[0]
+
+	for i := range ps.monsters {
+		mn := &ps.monsters[i]
+		if mn.Dead {
+			continue
+		}
+
+		// Advance animation frame
+		mn.FrameTime += dt * entities.MonsterFPS
+		for mn.FrameTime >= 1.0 {
+			mn.FrameTime -= 1.0
+			mn.FrameIdx = (mn.FrameIdx + 1) % mn.NumFrames
+		}
+
+		// Compute distance to player
+		dx := playerFoot[0] - mn.Pos[0]
+		dy := playerFoot[1] - mn.Pos[1]
+		dz := playerFoot[2] - mn.Pos[2]
+		dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+
+		// Alert check: LOS trace from monster to player (world only)
+		if !mn.Alerted && dist < 1024 {
+			tr := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, mn.Pos, playerFoot)
+			if !tr.Hit {
+				mn.Alerted = true
+			}
+		}
+
+		if mn.Alerted && dist > entities.MonsterMeleeDist && dist > 0 {
+			// Chase: move XY toward player, checking collision against world + brush entities
+			spd := entities.MonsterSpeed * dt
+			moveEnd := [3]float32{
+				mn.Pos[0] + dx/dist*spd,
+				mn.Pos[1] + dy/dist*spd,
+				mn.Pos[2],
+			}
+			tr := monsterMoveTrace(m, brushEnts, mn.Pos, moveEnd)
+			mn.Pos[0] = tr.EndPos[0]
+			mn.Pos[1] = tr.EndPos[1]
+		}
+
+		// Gravity: accumulate downward velocity and move Z
+		mn.VelZ -= gravity * dt
+		zEnd := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] + mn.VelZ*dt}
+		tr := monsterMoveTrace(m, brushEnts, mn.Pos, zEnd)
+		mn.Pos[2] = tr.EndPos[2]
+		if tr.Hit {
+			if tr.Normal[2] > 0.7 || tr.Normal[2] < -0.7 {
+				mn.VelZ = 0
+			}
+		}
+
+		// Melee attack
+		mn.AttackCooldown -= dt
+		if mn.Alerted && dist < entities.MonsterMeleeDist && mn.AttackCooldown <= 0 {
+			ps.playerHP -= entities.MonsterDamage
+			mn.AttackCooldown = entities.MonsterAttackCooldown
+		}
+	}
+}
+
+// monsterMoveTrace traces a point through world + brush entities using the point hull.
+func monsterMoveTrace(m *bsp.Map, brushEnts []*entities.BrushEntity, start, end [3]float32) bsp.TraceResult {
+	pointHull := m.Models[0].HeadNodes[0]
+	best := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, start, end)
+	for _, ent := range brushEnts {
+		entModel := m.Models[ent.ModelIndex]
+		entHull := entModel.HeadNodes[0]
+		mo := entModel.Origin
+		adjStart := [3]float32{
+			start[0] - mo[0] - ent.Offset[0],
+			start[1] - mo[1] - ent.Offset[1],
+			start[2] - mo[2] - ent.Offset[2],
+		}
+		adjEnd := [3]float32{
+			end[0] - mo[0] - ent.Offset[0],
+			end[1] - mo[1] - ent.Offset[1],
+			end[2] - mo[2] - ent.Offset[2],
+		}
+		tr := bsp.HullTrace(m.ClipNodes, m.Planes, int32(entHull), adjStart, adjEnd)
+		if tr.Hit && (!best.Hit || tr.Fraction < best.Fraction) {
+			tr.EndPos = [3]float32{
+				tr.EndPos[0] + mo[0] + ent.Offset[0],
+				tr.EndPos[1] + mo[1] + ent.Offset[1],
+				tr.EndPos[2] + mo[2] + ent.Offset[2],
+			}
+			best = tr
+		}
+	}
+	return best
 }
 
 // slideMove moves origin by disp, sliding along surfaces on impact (2-pass).
@@ -227,8 +464,8 @@ func traceAll(m *bsp.Map, ents []*entities.BrushEntity, hull int32, start, end [
 }
 
 // noclip is the fallback movement when no clip hull is available.
-func noclip(m *bsp.Map, s game.PlayerState, ev game.InputEvent, dt float32) game.PlayerState {
-	yaw := float64(mgl32.DegToRad(s.Yaw))
+func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
+	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
 	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
 	right := [3]float32{float32(math.Sin(yaw)), float32(-math.Cos(yaw)), 0}
 	spd := moveSpeed * dt
@@ -251,7 +488,23 @@ func noclip(m *bsp.Map, s game.PlayerState, ev game.InputEvent, dt float32) game
 	if ev.Keys[glfw.KeyLeftControl] || ev.Keys[glfw.KeyC] {
 		move[2] -= spd
 	}
-	s.Position = s.Position.Add(move)
-	s.LeafIndex = vis.LeafForPoint(m, [3]float32(s.Position))
-	return s
+	ps.player.Position = ps.player.Position.Add(move)
+	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
+
+	tickWeapon(ps, ev, dt)
+	tickMonsters(m, nil, ps, dt)
+
+	ps.player.Health = ps.playerHP
+	ps.player.WeaponFrame = ps.weaponFrame
+	ps.player.MonsterItems = ps.player.MonsterItems[:0]
+	for _, mn := range ps.monsters {
+		if mn.Dead {
+			continue
+		}
+		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
+			Pos:    mn.Pos,
+			MdlIdx: mn.MdlIdx,
+			Frame:  mn.FrameIdx,
+		})
+	}
 }

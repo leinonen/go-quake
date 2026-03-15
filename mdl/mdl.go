@@ -221,6 +221,9 @@ func (m *MDL) BuildVerts(frameIdx int) []float32 {
 	return verts
 }
 
+// NumFrames returns the number of animation frames in the MDL.
+func (m *MDL) NumFrames() int { return len(m.frames) }
+
 // SkinRGB converts palette-indexed skin pixels to packed RGB bytes.
 // palette must be at least 768 bytes (256 × RGB triplets).
 func (m *MDL) SkinRGB(skinIdx int, palette []byte) []byte {

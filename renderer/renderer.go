@@ -20,16 +20,23 @@ type entityRenderable struct {
 	numVerts int32
 }
 
-// itemGroup holds one VAO+texture pair for a single texture within an item model.
+// itemGroup holds one VAO+texture pair for a single texture within an item model frame.
 type itemGroup struct {
 	vao      uint32
 	numVerts int32
 	tex      uint32
 }
 
-// itemRenderable holds all texture groups for one unique item model.
+// itemRenderable holds all frames for one unique item model.
+// Each frame is a slice of texture groups (MDL = 1 group, BSP = N groups).
 type itemRenderable struct {
-	groups []itemGroup
+	frames [][]itemGroup // [frameIdx][groupIdx]
+}
+
+// weaponFrameData holds one VAO for one weapon animation frame.
+type weaponFrameData struct {
+	vao      uint32
+	numVerts int32
 }
 
 // WeaponMesh contains view-weapon geometry and skin data ready for upload.
@@ -40,12 +47,17 @@ type WeaponMesh struct {
 	TexH   int
 }
 
+// ItemModel holds all animation frames for one unique item or monster model.
+type ItemModel struct {
+	Frames [][]*WeaponMesh // [frameIdx] → texture groups
+}
+
 // Renderer owns all GL state and draws the world.
 type Renderer struct {
-	worldProg   uint32
-	vao         uint32
-	vbo         uint32
-	numVerts    int32
+	worldProg uint32
+	vao       uint32
+	vbo       uint32
+	numVerts  int32
 
 	compute          *ComputeState
 	usePVS           bool
@@ -55,27 +67,31 @@ type Renderer struct {
 	atlasTexture     uint32
 	atlasW, atlasH   int32
 
-	mvpLoc            int32
-	usePVSLoc         int32
-	totalFaceLoc      int32
-	atlasLoc          int32
-	atlasSizeLoc      int32
-	entityOffsetLoc   int32
-	timeLoc           int32
+	mvpLoc          int32
+	usePVSLoc       int32
+	totalFaceLoc    int32
+	atlasLoc        int32
+	atlasSizeLoc    int32
+	entityOffsetLoc int32
+	timeLoc         int32
 
 	skyProg    uint32
 	skyVAO     uint32
 	skyMVPLoc  int32
 	skyTimeLoc int32
 
-	// view weapon
-	weaponProg     uint32
-	weaponVAO      uint32
-	weaponNumVerts int32
-	weaponTex      uint32
-	weapProjLoc    int32
-	weapMatLoc     int32
-	weapTexLoc     int32
+	// view weapon — one VAO per animation frame, single shared texture
+	weaponProg   uint32
+	weaponFrames []weaponFrameData
+	weaponTex    uint32
+	weapProjLoc  int32
+	weapMatLoc   int32
+	weapTexLoc   int32
+
+	// HUD health bar
+	hudProg    uint32
+	hudVAO     uint32
+	hudFracLoc int32
 
 	startTime  time.Time
 	entityVAOs []entityRenderable
@@ -83,7 +99,6 @@ type Renderer struct {
 }
 
 // skyboxVerts is a unit cube (36 vertices, Z-up) used as the skybox mesh.
-// Face culling is disabled during the skybox draw, so winding order doesn't matter.
 var skyboxVerts = [...]float32{
 	// Bottom (Z = -1)
 	-1, -1, -1, 1, -1, -1, 1, 1, -1,
@@ -107,10 +122,17 @@ var skyboxVerts = [...]float32{
 
 // Init initialises GL state and uploads BSP geometry.
 // palette is 768 bytes (256 RGB triplets) from gfx/palette.lmp; nil uses index-as-grey fallback.
-// weapon is optional view-weapon geometry; pass nil to skip weapon rendering.
-// items is a slice of per-unique-model mesh groups for world item pickups; may be nil.
-// Each inner slice holds one WeaponMesh per texture group (MDL = 1 group, BSP = N groups).
-func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc string, palette []byte, weapon *WeaponMesh, items [][]*WeaponMesh) (*Renderer, error) {
+// weapon is a slice of per-frame WeaponMesh (one per animation frame); nil/empty skips weapon rendering.
+// items is a slice of per-unique-model ItemModel for world item pickups and monsters; may be nil.
+func Init(m *bsp.Map,
+	vertSrc, fragSrc, computeSrc,
+	skyVertSrc, skyFragSrc,
+	weapVertSrc, weapFragSrc,
+	hudVertSrc, hudFragSrc string,
+	palette []byte,
+	weapon []*WeaponMesh,
+	items []ItemModel) (*Renderer, error) {
+
 	prog, err := compileRender(vertSrc, fragSrc)
 	if err != nil {
 		return nil, fmt.Errorf("compile render shaders: %w", err)
@@ -163,7 +185,7 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weap
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 	gl.BindTexture(gl.TEXTURE_2D, 0)
 
-	// Per-face atlas info SSBO (binding 5): vec4{atlasX, atlasY, texW, texH} in pixels
+	// Per-face atlas info SSBO (binding 5)
 	r.ssboFaceAtlas = buildFaceAtlasSSBO(m, rects)
 
 	// Build vertex buffer from BSP faces (6 floats per vertex: x,y,z, faceIdx, s, t)
@@ -172,21 +194,15 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weap
 
 	gl.GenVertexArrays(1, &r.vao)
 	gl.BindVertexArray(r.vao)
-
 	gl.GenBuffers(1, &r.vbo)
 	gl.BindBuffer(gl.ARRAY_BUFFER, r.vbo)
 	gl.BufferData(gl.ARRAY_BUFFER, len(verts)*4, unsafe.Pointer(&verts[0]), gl.STATIC_DRAW)
-
-	// aPos (location 0): 3 floats at offset 0, stride 24
 	gl.EnableVertexAttribArray(0)
 	gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 24, 0)
-	// aFaceIndex (location 1): 1 float at offset 12
 	gl.EnableVertexAttribArray(1)
 	gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 24, 12)
-	// aTexST (location 2): 2 floats at offset 16
 	gl.EnableVertexAttribArray(2)
 	gl.VertexAttribPointerWithOffset(2, 2, gl.FLOAT, false, 24, 16)
-
 	gl.BindVertexArray(0)
 
 	// Build VAOs for brush entity sub-models (Models[1..N])
@@ -228,8 +244,8 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weap
 	gl.Enable(gl.CULL_FACE)
 	gl.CullFace(gl.FRONT) // Quake front = clockwise
 
-	// View weapon
-	if weapon != nil && len(weapon.Verts) > 0 && len(weapon.TexRGB) > 0 {
+	// Weapon/item shader — compile if either weapon frames or items are present
+	if len(weapon) > 0 || len(items) > 0 {
 		wp, err := compileRender(weapVertSrc, weapFragSrc)
 		if err != nil {
 			return nil, fmt.Errorf("compile weapon shaders: %w", err)
@@ -238,70 +254,120 @@ func Init(m *bsp.Map, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weap
 		r.weapProjLoc = gl.GetUniformLocation(wp, gl.Str("uProj\x00"))
 		r.weapMatLoc = gl.GetUniformLocation(wp, gl.Str("uWeaponMat\x00"))
 		r.weapTexLoc = gl.GetUniformLocation(wp, gl.Str("uTex\x00"))
-
-		gl.GenVertexArrays(1, &r.weaponVAO)
-		gl.BindVertexArray(r.weaponVAO)
-		var wvbo uint32
-		gl.GenBuffers(1, &wvbo)
-		gl.BindBuffer(gl.ARRAY_BUFFER, wvbo)
-		gl.BufferData(gl.ARRAY_BUFFER, len(weapon.Verts)*4, unsafe.Pointer(&weapon.Verts[0]), gl.STATIC_DRAW)
-		// aPos (location 0): 3 floats, stride 20
-		gl.EnableVertexAttribArray(0)
-		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
-		// aTexST (location 1): 2 floats at offset 12
-		gl.EnableVertexAttribArray(1)
-		gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 20, 12)
-		gl.BindVertexArray(0)
-		r.weaponNumVerts = int32(len(weapon.Verts) / 5)
-
-		gl.GenTextures(1, &r.weaponTex)
-		gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
-		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(weapon.TexW), int32(weapon.TexH), 0,
-			gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&weapon.TexRGB[0]))
-		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-		gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-		gl.BindTexture(gl.TEXTURE_2D, 0)
 	}
 
-	// Upload item model VAOs — each model is a slice of texture groups (x,y,z,u,v format).
-	// MDL items have one group; BSP items have one group per unique texture.
-	for _, groups := range items {
-		var ir itemRenderable
-		for _, g := range groups {
-			if g == nil || len(g.Verts) == 0 || len(g.TexRGB) == 0 {
+	// View weapon — upload one VAO per animation frame, texture once from frame 0
+	if len(weapon) > 0 {
+		// Upload skin texture from first valid frame
+		for _, wf := range weapon {
+			if wf != nil && len(wf.TexRGB) > 0 {
+				gl.GenTextures(1, &r.weaponTex)
+				gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
+				gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(wf.TexW), int32(wf.TexH), 0,
+					gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&wf.TexRGB[0]))
+				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+				gl.BindTexture(gl.TEXTURE_2D, 0)
+				break
+			}
+		}
+		// Upload one VAO per frame
+		for _, wf := range weapon {
+			if wf == nil || len(wf.Verts) == 0 {
+				r.weaponFrames = append(r.weaponFrames, weaponFrameData{})
 				continue
 			}
-			var ivao, ivbo uint32
-			gl.GenVertexArrays(1, &ivao)
-			gl.BindVertexArray(ivao)
-			gl.GenBuffers(1, &ivbo)
-			gl.BindBuffer(gl.ARRAY_BUFFER, ivbo)
-			gl.BufferData(gl.ARRAY_BUFFER, len(g.Verts)*4, unsafe.Pointer(&g.Verts[0]), gl.STATIC_DRAW)
+			var wvao, wvbo uint32
+			gl.GenVertexArrays(1, &wvao)
+			gl.BindVertexArray(wvao)
+			gl.GenBuffers(1, &wvbo)
+			gl.BindBuffer(gl.ARRAY_BUFFER, wvbo)
+			gl.BufferData(gl.ARRAY_BUFFER, len(wf.Verts)*4, unsafe.Pointer(&wf.Verts[0]), gl.STATIC_DRAW)
 			gl.EnableVertexAttribArray(0)
 			gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
 			gl.EnableVertexAttribArray(1)
 			gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 20, 12)
 			gl.BindVertexArray(0)
-
-			var itex uint32
-			gl.GenTextures(1, &itex)
-			gl.BindTexture(gl.TEXTURE_2D, itex)
-			gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(g.TexW), int32(g.TexH), 0,
-				gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&g.TexRGB[0]))
-			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-			// GL_REPEAT so BSP item UV (s/texW, t/texH) tiles correctly when > 1
-			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT)
-			gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT)
-			gl.BindTexture(gl.TEXTURE_2D, 0)
-
-			ir.groups = append(ir.groups, itemGroup{
-				vao:      ivao,
-				numVerts: int32(len(g.Verts) / 5),
-				tex:      itex,
+			r.weaponFrames = append(r.weaponFrames, weaponFrameData{
+				vao:      wvao,
+				numVerts: int32(len(wf.Verts) / 5),
 			})
 		}
+	}
+
+	// Upload item model VAOs — each ItemModel has frames, each frame has texture groups.
+	for _, im := range items {
+		var ir itemRenderable
+		for _, frameGroups := range im.Frames {
+			var groups []itemGroup
+			for _, g := range frameGroups {
+				if g == nil || len(g.Verts) == 0 || len(g.TexRGB) == 0 {
+					continue
+				}
+				var ivao, ivbo uint32
+				gl.GenVertexArrays(1, &ivao)
+				gl.BindVertexArray(ivao)
+				gl.GenBuffers(1, &ivbo)
+				gl.BindBuffer(gl.ARRAY_BUFFER, ivbo)
+				gl.BufferData(gl.ARRAY_BUFFER, len(g.Verts)*4, unsafe.Pointer(&g.Verts[0]), gl.STATIC_DRAW)
+				gl.EnableVertexAttribArray(0)
+				gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
+				gl.EnableVertexAttribArray(1)
+				gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 20, 12)
+				gl.BindVertexArray(0)
+
+				var itex uint32
+				gl.GenTextures(1, &itex)
+				gl.BindTexture(gl.TEXTURE_2D, itex)
+				gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(g.TexW), int32(g.TexH), 0,
+					gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&g.TexRGB[0]))
+				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT)
+				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT)
+				gl.BindTexture(gl.TEXTURE_2D, 0)
+
+				groups = append(groups, itemGroup{
+					vao:      ivao,
+					numVerts: int32(len(g.Verts) / 5),
+					tex:      itex,
+				})
+			}
+			ir.frames = append(ir.frames, groups)
+		}
 		r.itemVAOs = append(r.itemVAOs, ir)
+	}
+
+	// HUD health bar — compile shader and upload static quad VAO
+	if len(hudVertSrc) > 0 && len(hudFragSrc) > 0 {
+		hp, err := compileRender(hudVertSrc, hudFragSrc)
+		if err != nil {
+			return nil, fmt.Errorf("compile HUD shaders: %w", err)
+		}
+		r.hudProg = hp
+		r.hudFracLoc = gl.GetUniformLocation(hp, gl.Str("uFrac\x00"))
+
+		// NDC quad covering bottom strip: x[-1,1], y[-1,-0.97], uv.x[0,1]
+		// Format: x, y, u, v (4 floats per vertex)
+		hudVerts := [...]float32{
+			-1, -1, 0, 0,
+			1, -1, 1, 0,
+			1, -0.97, 1, 1,
+			-1, -1, 0, 0,
+			1, -0.97, 1, 1,
+			-1, -0.97, 0, 1,
+		}
+		gl.GenVertexArrays(1, &r.hudVAO)
+		gl.BindVertexArray(r.hudVAO)
+		var hvbo uint32
+		gl.GenBuffers(1, &hvbo)
+		gl.BindBuffer(gl.ARRAY_BUFFER, hvbo)
+		gl.BufferData(gl.ARRAY_BUFFER, len(hudVerts)*4, unsafe.Pointer(&hudVerts[0]), gl.STATIC_DRAW)
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointerWithOffset(0, 2, gl.FLOAT, false, 16, 0)
+		gl.EnableVertexAttribArray(1)
+		gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 16, 8)
+		gl.BindVertexArray(0)
 	}
 
 	return r, nil
@@ -374,7 +440,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 		gl.Uniform1i(r.usePVSLoc, boolToInt32(r.usePVS))
 	}
 
-	// Draw world items — MDL/BSP models at their BSP entity origins, occluded by world geometry.
+	// Draw world items and monsters — MDL/BSP models at their origins.
 	if r.weaponProg != 0 && len(frame.Items) > 0 {
 		gl.Disable(gl.CULL_FACE)
 		gl.UseProgram(r.weaponProg)
@@ -386,12 +452,16 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 				continue
 			}
 			ir := r.itemVAOs[is.MdlIdx]
-			if len(ir.groups) == 0 {
+			if len(ir.frames) == 0 {
 				continue
+			}
+			frameIdx := is.Frame
+			if frameIdx < 0 || frameIdx >= len(ir.frames) {
+				frameIdx = 0
 			}
 			itemMat := view.Mul4(mgl32.Translate3D(is.Pos[0], is.Pos[1], is.Pos[2]))
 			gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &itemMat[0])
-			for _, g := range ir.groups {
+			for _, g := range ir.frames[frameIdx] {
 				gl.BindTexture(gl.TEXTURE_2D, g.tex)
 				gl.BindVertexArray(g.vao)
 				gl.DrawArrays(gl.TRIANGLES, 0, g.numVerts)
@@ -403,9 +473,6 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	}
 
 	// Draw skybox last — rotation-only view so it's infinitely far away.
-	// gl_Position.z = gl_Position.w in the vert shader sets depth = 1.0,
-	// so DepthFunc(LEQUAL) lets it pass only where nothing closer was drawn
-	// (i.e. the holes left by discarded sky faces).
 	skyView := mgl32.LookAtV(mgl32.Vec3{0, 0, 0}, forward, up)
 	skyMVP := proj.Mul4(skyView)
 	gl.DepthFunc(gl.LEQUAL)
@@ -421,37 +488,56 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 
 	// Draw view weapon on top of everything — clear depth so it is never
 	// occluded by world geometry.
-	if r.weaponProg != 0 {
+	if r.weaponProg != 0 && len(r.weaponFrames) > 0 {
 		gl.Clear(gl.DEPTH_BUFFER_BIT)
 		gl.Disable(gl.CULL_FACE)
 
-		// Position weapon in camera/view space.
-		// Quake MDL view space (yaw=0,pitch=0): X=forward, -Y=right, Z=up.
-		// GL camera space: -Z=forward, +X=right, +Y=up.
-		// Correct transform: RotX(-90) * RotZ(90)
-		//   (RotZ(90) first, then RotX(-90)):
-		//   +X(fwd) → -Z ✓   -Y(right) → +X ✓   +Z(up) → +Y ✓
-		rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
-		rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
-		rot := rotX.Mul4(rotZ)
-		// MDL origin.Z ≈ -24 (axe sits below eye level); after rotation that
-		// becomes -24 in camera Y, so add +24 to keep weapon in frame.
-		trans := mgl32.Translate3D(16, -10, -25)
-		weaponMat := trans.Mul4(rot)
+		// Select frame, clamped to valid range
+		wfIdx := frame.Player.WeaponFrame
+		if wfIdx < 0 || wfIdx >= len(r.weaponFrames) {
+			wfIdx = 0
+		}
+		wf := r.weaponFrames[wfIdx]
+		if wf.vao != 0 {
+			rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
+			rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
+			rot := rotX.Mul4(rotZ)
+			trans := mgl32.Translate3D(16, -10, -25)
+			weaponMat := trans.Mul4(rot)
 
-		gl.UseProgram(r.weaponProg)
-		gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
-		gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &weaponMat[0])
+			gl.UseProgram(r.weaponProg)
+			gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
+			gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &weaponMat[0])
 
-		gl.ActiveTexture(gl.TEXTURE0)
-		gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
-		gl.Uniform1i(r.weapTexLoc, 0)
+			gl.ActiveTexture(gl.TEXTURE0)
+			gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
+			gl.Uniform1i(r.weapTexLoc, 0)
 
-		gl.BindVertexArray(r.weaponVAO)
-		gl.DrawArrays(gl.TRIANGLES, 0, r.weaponNumVerts)
-		gl.BindVertexArray(0)
+			gl.BindVertexArray(wf.vao)
+			gl.DrawArrays(gl.TRIANGLES, 0, wf.numVerts)
+			gl.BindVertexArray(0)
+		}
 
 		gl.Enable(gl.CULL_FACE)
+	}
+
+	// Draw HUD health bar — last, depth test disabled.
+	if r.hudProg != 0 {
+		gl.Disable(gl.DEPTH_TEST)
+		gl.Disable(gl.CULL_FACE)
+		gl.UseProgram(r.hudProg)
+		frac := float32(frame.Player.Health) / 100.0
+		if frac < 0 {
+			frac = 0
+		} else if frac > 1 {
+			frac = 1
+		}
+		gl.Uniform1f(r.hudFracLoc, frac)
+		gl.BindVertexArray(r.hudVAO)
+		gl.DrawArrays(gl.TRIANGLES, 0, 6)
+		gl.BindVertexArray(0)
+		gl.Enable(gl.CULL_FACE)
+		gl.Enable(gl.DEPTH_TEST)
 	}
 }
 
@@ -485,7 +571,6 @@ func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
 		face := m.Faces[faceIdx]
 		fi := float32(faceIdx)
 
-		// Texture projection vectors for this face
 		var sv, tv [4]float32
 		if int(face.TexInfo) < len(m.TexInfos) {
 			ti := m.TexInfos[face.TexInfo]
@@ -493,7 +578,6 @@ func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
 			tv = ti.Vecs[1]
 		}
 
-		// Collect face vertices via surfedges
 		faceVs := make([][3]float32, 0, face.NumEdges)
 		for i := 0; i < int(face.NumEdges); i++ {
 			seIdx := int(face.FirstEdge) + i
@@ -506,7 +590,6 @@ func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
 			}
 			faceVs = append(faceVs, v)
 		}
-		// Fan triangulation from vertex 0
 		for i := 1; i+1 < len(faceVs); i++ {
 			for _, vtx := range [][3]float32{faceVs[0], faceVs[i], faceVs[i+1]} {
 				s := vtx[0]*sv[0] + vtx[1]*sv[1] + vtx[2]*sv[2] + sv[3]
@@ -518,12 +601,10 @@ func buildModelVerts(m *bsp.Map, modelIdx int) []float32 {
 	return verts
 }
 
-// buildAtlas packs all miptex greyscale pixels into a single 2D atlas texture.
-// Returns pixel data (R8), atlas dimensions, and per-miptex rect {x,y,w,h}.
+// buildAtlas packs all miptex pixels into a single 2D atlas texture.
 func buildAtlas(mipTexes []bsp.MipTex, palette []byte) (pixels []byte, atlasW, atlasH int, rects [][4]int32) {
 	atlasW = 2048
 
-	// Build RGB lookup from palette; fall back to greyscale ramp if no palette.
 	palRGB := make([][3]byte, 256)
 	if len(palette) >= 768 {
 		for i := 0; i < 256; i++ {
@@ -554,7 +635,6 @@ func buildAtlas(mipTexes []bsp.MipTex, palette []byte) (pixels []byte, atlasW, a
 		curX += mt.Width
 	}
 	rawH := curY + rowH
-	// Round up to next power of 2
 	atlasH = 1
 	for atlasH < rawH {
 		atlasH <<= 1
@@ -583,7 +663,6 @@ func buildAtlas(mipTexes []bsp.MipTex, palette []byte) (pixels []byte, atlasW, a
 }
 
 // BuildBSPItemMesh converts a small BSP sub-model file into per-texture WeaponMesh groups.
-// UV is stored as s/texW, t/texH (normalized, may tile > 1 — upload textures with GL_REPEAT).
 func BuildBSPItemMesh(data []byte, palette []byte) ([]*WeaponMesh, error) {
 	m, err := bsp.LoadBytes(data)
 	if err != nil {
@@ -609,7 +688,6 @@ func BuildBSPItemMesh(data []byte, palette []byte) ([]*WeaponMesh, error) {
 	firstFace := int(model.FirstFace)
 	lastFace := firstFace + int(model.NumFaces)
 
-	// Collect vertices per miptex index
 	texVerts := map[int][]float32{}
 	for faceIdx := firstFace; faceIdx < lastFace; faceIdx++ {
 		face := m.Faces[faceIdx]
@@ -644,8 +722,8 @@ func BuildBSPItemMesh(data []byte, palette []byte) ([]*WeaponMesh, error) {
 				s := vtx[0]*sv[0] + vtx[1]*sv[1] + vtx[2]*sv[2] + sv[3]
 				t := vtx[0]*tv[0] + vtx[1]*tv[1] + vtx[2]*tv[2] + tv[3]
 				u := s / float32(mt.Width)
-				v := t / float32(mt.Height)
-				texVerts[mipIdx] = append(texVerts[mipIdx], vtx[0], vtx[1], vtx[2], u, v)
+				v2 := t / float32(mt.Height)
+				texVerts[mipIdx] = append(texVerts[mipIdx], vtx[0], vtx[1], vtx[2], u, v2)
 			}
 		}
 	}
@@ -674,7 +752,7 @@ func BuildBSPItemMesh(data []byte, palette []byte) ([]*WeaponMesh, error) {
 	return groups, nil
 }
 
-// buildFaceAtlasSSBO creates an SSBO (binding 5) with per-face atlas info: vec4{x,y,w,h} in pixels.
+// buildFaceAtlasSSBO creates an SSBO (binding 5) with per-face atlas info.
 func buildFaceAtlasSSBO(m *bsp.Map, rects [][4]int32) uint32 {
 	data := make([]float32, len(m.Faces)*4)
 	for faceIdx := range m.Faces {
@@ -701,7 +779,6 @@ func buildFaceAtlasSSBO(m *bsp.Map, rects [][4]int32) uint32 {
 	return ssbo
 }
 
-// compileRender links vertex + fragment shaders.
 func compileRender(vertSrc, fragSrc string) (uint32, error) {
 	vert, err := compileShader(vertSrc, gl.VERTEX_SHADER)
 	if err != nil {
@@ -714,7 +791,6 @@ func compileRender(vertSrc, fragSrc string) (uint32, error) {
 	return linkProgram(vert, frag)
 }
 
-// compileCompute links a compute shader program.
 func compileCompute(src string) (uint32, error) {
 	shader, err := compileShader(src, gl.COMPUTE_SHADER)
 	if err != nil {

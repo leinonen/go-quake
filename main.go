@@ -51,6 +51,12 @@ var weapVertSrc string
 //go:embed renderer/shaders/weapon.frag.glsl
 var weapFragSrc string
 
+//go:embed renderer/shaders/hud.vert.glsl
+var hudVertSrc string
+
+//go:embed renderer/shaders/hud.frag.glsl
+var hudFragSrc string
+
 const eyeHeight = 22.0
 
 func main() {
@@ -60,10 +66,12 @@ func main() {
 
 	var m *bsp.Map
 	var palette []byte
-	var weapon *renderer.WeaponMesh
-	var itemMeshes [][]*renderer.WeaponMesh
+	var weaponFrames []*renderer.WeaponMesh
+	var numWeaponFrames int
+	var itemModels []renderer.ItemModel
 	var itemStates []game.ItemState
-	var itemSpawns []entities.ItemSpawn // item-only spawns (not monsters) for pickup detection
+	var itemSpawns []entities.ItemSpawn
+	var monsterStates []entities.MonsterState
 
 	switch {
 	case *pakPath != "":
@@ -90,20 +98,30 @@ func main() {
 		// Load palette for texture colour conversion
 		palette, _ = p.ReadFile("gfx/palette.lmp")
 
-		// Load view axe model
+		// Load view axe model — all animation frames
 		if axeData, err := p.ReadFile("progs/v_axe.mdl"); err == nil {
 			if axeMDL, err := mdl.Load(axeData); err == nil {
-				verts := axeMDL.BuildVerts(0)
+				nf := axeMDL.NumFrames()
+				if nf <= 0 {
+					nf = 1
+				}
 				texRGB := axeMDL.SkinRGB(0, palette)
-				if len(verts) > 0 && len(texRGB) > 0 {
-					weapon = &renderer.WeaponMesh{
-						Verts:  verts,
-						TexRGB: texRGB,
-						TexW:   axeMDL.SkinWidth,
-						TexH:   axeMDL.SkinHeight,
+				for f := 0; f < nf; f++ {
+					verts := axeMDL.BuildVerts(f)
+					if len(verts) > 0 && len(texRGB) > 0 {
+						weaponFrames = append(weaponFrames, &renderer.WeaponMesh{
+							Verts:  verts,
+							TexRGB: texRGB,
+							TexW:   axeMDL.SkinWidth,
+							TexH:   axeMDL.SkinHeight,
+						})
 					}
-					log.Printf("v_axe.mdl loaded: %d tris, skin %dx%d",
-						len(verts)/15, axeMDL.SkinWidth, axeMDL.SkinHeight)
+				}
+				numWeaponFrames = len(weaponFrames)
+				if numWeaponFrames > 0 {
+					log.Printf("v_axe.mdl loaded: %d frames, %d tris, skin %dx%d",
+						numWeaponFrames, len(weaponFrames[0].Verts)/15,
+						axeMDL.SkinWidth, axeMDL.SkinHeight)
 				}
 			} else {
 				log.Printf("v_axe.mdl parse: %v", err)
@@ -131,50 +149,19 @@ func main() {
 		// Load item models (MDL or BSP sub-model) referenced by the map entity lump.
 		itemSpawns = entities.ParseItems(m.Entities)
 		modelPathToIdx := map[string]int{}
+
 		for _, sp := range itemSpawns {
 			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
-				modelPathToIdx[sp.ModelPath] = len(itemMeshes)
-				var groups []*renderer.WeaponMesh
-				if idata, ierr := p.ReadFile(sp.ModelPath); ierr == nil {
-					if strings.HasSuffix(sp.ModelPath, ".mdl") {
-						if imdl, merr := mdl.Load(idata); merr == nil {
-							verts := imdl.BuildVerts(0)
-							texRGB := imdl.SkinRGB(0, palette)
-							if len(verts) > 0 && len(texRGB) > 0 {
-								groups = []*renderer.WeaponMesh{{
-									Verts:  verts,
-									TexRGB: texRGB,
-									TexW:   imdl.SkinWidth,
-									TexH:   imdl.SkinHeight,
-								}}
-								log.Printf("item MDL loaded:  %s (%d tris)", sp.ModelPath, len(verts)/15)
-							}
-						} else {
-							log.Printf("item MDL parse failed: %s: %v", sp.ModelPath, merr)
-						}
-					} else if strings.HasSuffix(sp.ModelPath, ".bsp") {
-						var merr error
-						groups, merr = renderer.BuildBSPItemMesh(idata, palette)
-						if merr != nil {
-							log.Printf("item BSP parse failed: %s: %v", sp.ModelPath, merr)
-						} else {
-							total := 0
-							for _, g := range groups {
-								total += len(g.Verts) / 15
-							}
-							log.Printf("item BSP loaded:  %s (%d tris, %d textures)", sp.ModelPath, total, len(groups))
-						}
-					}
-				} else {
-					log.Printf("item model not in PAK: %s", sp.ModelPath)
-				}
-				itemMeshes = append(itemMeshes, groups)
+				modelPathToIdx[sp.ModelPath] = len(itemModels)
+				im := loadItemModel(p, sp.ModelPath, palette)
+				itemModels = append(itemModels, im)
 			}
 			itemStates = append(itemStates, game.ItemState{
 				Pos:    sp.Pos,
 				MdlIdx: modelPathToIdx[sp.ModelPath],
 			})
 		}
+
 		// Warn about item-like classnames we have no mapping for
 		for _, e := range bsp.ParseEntities(m.Entities) {
 			class := e.Fields["classname"]
@@ -182,41 +169,21 @@ func main() {
 				log.Printf("item classname not mapped: %s", class)
 			}
 		}
-		log.Printf("items: %d spawns, %d unique models", len(itemStates), len(itemMeshes))
+		log.Printf("items: %d spawns, %d unique models", len(itemStates), len(itemModels))
 
-		// Load monster MDL models from entity lump.
+		// Load monster MDL models — all animation frames.
 		monsterSpawns := entities.ParseMonsters(m.Entities)
 		for _, sp := range monsterSpawns {
 			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
-				modelPathToIdx[sp.ModelPath] = len(itemMeshes)
-				var groups []*renderer.WeaponMesh
-				if mdata, merr := p.ReadFile(sp.ModelPath); merr == nil {
-					if mmdl, merr := mdl.Load(mdata); merr == nil {
-						verts := mmdl.BuildVerts(0)
-						texRGB := mmdl.SkinRGB(0, palette)
-						if len(verts) > 0 && len(texRGB) > 0 {
-							groups = []*renderer.WeaponMesh{{
-								Verts:  verts,
-								TexRGB: texRGB,
-								TexW:   mmdl.SkinWidth,
-								TexH:   mmdl.SkinHeight,
-							}}
-							log.Printf("monster MDL loaded: %s (%d tris)", sp.ModelPath, len(verts)/15)
-						}
-					} else {
-						log.Printf("monster MDL parse failed: %s: %v", sp.ModelPath, merr)
-					}
-				} else {
-					log.Printf("monster MDL not in PAK: %s", sp.ModelPath)
-				}
-				itemMeshes = append(itemMeshes, groups)
+				modelPathToIdx[sp.ModelPath] = len(itemModels)
+				im := loadMDLAllFrames(p, sp.ModelPath, palette)
+				itemModels = append(itemModels, im)
 			}
-			itemStates = append(itemStates, game.ItemState{
-				Pos:    sp.Pos,
-				MdlIdx: modelPathToIdx[sp.ModelPath],
-			})
+			mdlIdx := modelPathToIdx[sp.ModelPath]
+			nf := len(itemModels[mdlIdx].Frames)
+			monsterStates = append(monsterStates, entities.NewMonsterState(sp, mdlIdx, nf))
 		}
-		log.Printf("monsters: %d spawns, %d unique models", len(monsterSpawns), len(modelPathToIdx))
+		log.Printf("monsters: %d spawns, %d unique models", len(monsterSpawns), len(modelPathToIdx)-len(itemSpawns))
 
 	case *mapName != "":
 		// Direct .bsp file
@@ -237,7 +204,7 @@ func main() {
 	log.Printf("BSP loaded: %d leaves, %d nodes, %d faces, %d vertices",
 		len(m.Leaves), len(m.Nodes), len(m.Faces), len(m.Vertices))
 
-	// Spawn position: parse info_player_start from entities, fall back to AABB centre.
+	// Spawn position
 	var spawn mgl32.Vec3
 	if org, ok := m.SpawnPoint(); ok {
 		spawn = mgl32.Vec3{org[0], org[1], org[2] + eyeHeight}
@@ -275,7 +242,12 @@ func main() {
 		log.Fatalf("gl init: %v", err)
 	}
 
-	rend, err := renderer.Init(m, vertSrc, fragSrc, computeSrc, skyVertSrc, skyFragSrc, weapVertSrc, weapFragSrc, palette, weapon, itemMeshes)
+	rend, err := renderer.Init(m,
+		vertSrc, fragSrc, computeSrc,
+		skyVertSrc, skyFragSrc,
+		weapVertSrc, weapFragSrc,
+		hudVertSrc, hudFragSrc,
+		palette, weaponFrames, itemModels)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}
@@ -284,9 +256,9 @@ func main() {
 	log.Printf("brush entities: %d (func_door/func_plat)", len(mgr.Entities))
 
 	bus := game.NewBus()
-	go physics.Run(m, mgr, bus, spawn, itemSpawns)
+	go physics.Run(m, mgr, bus, spawn, itemSpawns, monsterStates, numWeaponFrames)
 
-	playerState := game.PlayerState{Position: spawn}
+	playerState := game.PlayerState{Position: spawn, Health: 100}
 	pickedItems := make([]bool, len(itemSpawns))
 	numItems := len(itemSpawns)
 
@@ -347,14 +319,15 @@ func main() {
 			}
 		}
 
-		// Build visible item list (exclude picked items; monsters always shown).
+		// Build visible item list (exclude picked items) + live monsters from physics.
 		visibleItems := itemStates[:0:0]
 		for i, is := range itemStates {
-			if i < numItems && pickedItems[i] {
+			if pickedItems[i] {
 				continue
 			}
 			visibleItems = append(visibleItems, is)
 		}
+		visibleItems = append(visibleItems, playerState.MonsterItems...)
 
 		w, h := win.GetFramebufferSize()
 		gl.Viewport(0, 0, int32(w), int32(h))
@@ -369,8 +342,8 @@ func main() {
 		debugTick++
 		if debugTick%30 == 0 {
 			pos := [3]float32(playerState.Position)
-			title := fmt.Sprintf("go-quake | leaf %d | pos: %.0f %.0f %.0f",
-				playerState.LeafIndex, pos[0], pos[1], pos[2])
+			title := fmt.Sprintf("go-quake | HP: %d | leaf %d | pos: %.0f %.0f %.0f",
+				playerState.Health, playerState.LeafIndex, pos[0], pos[1], pos[2])
 			win.SetTitle(title)
 		}
 
@@ -379,12 +352,96 @@ func main() {
 
 	close(bus.Shutdown)
 
-	// Restore cursor before GLFW teardown. On Linux/X11, destroying a window
-	// with CursorDisabled active can block glfwTerminate waiting for the pointer
-	// ungrab to complete. Resetting to Normal and flushing events lets GLFW
-	// finish cleanly.
 	win.SetInputMode(glfw.CursorMode, glfw.CursorNormal)
 	glfw.PollEvents()
+}
+
+// pakReader abstracts ReadFile from both pak.PAK and pak.MultiPAK.
+type pakReader interface {
+	ReadFile(name string) ([]byte, error)
+}
+
+// loadItemModel loads one item model (MDL or BSP) and returns an ItemModel with all frames.
+// For MDL: one frame (frame 0 only — items don't animate).
+// For BSP: one frame with multiple texture groups.
+func loadItemModel(p pakReader, modelPath string, palette []byte) renderer.ItemModel {
+	idata, err := p.ReadFile(modelPath)
+	if err != nil {
+		log.Printf("item model not in PAK: %s", modelPath)
+		return renderer.ItemModel{}
+	}
+	if strings.HasSuffix(modelPath, ".mdl") {
+		imdl, err := mdl.Load(idata)
+		if err != nil {
+			log.Printf("item MDL parse failed: %s: %v", modelPath, err)
+			return renderer.ItemModel{}
+		}
+		verts := imdl.BuildVerts(0)
+		texRGB := imdl.SkinRGB(0, palette)
+		if len(verts) == 0 || len(texRGB) == 0 {
+			return renderer.ItemModel{}
+		}
+		log.Printf("item MDL loaded:  %s (%d tris)", modelPath, len(verts)/15)
+		return renderer.ItemModel{
+			Frames: [][]*renderer.WeaponMesh{{{
+				Verts:  verts,
+				TexRGB: texRGB,
+				TexW:   imdl.SkinWidth,
+				TexH:   imdl.SkinHeight,
+			}}},
+		}
+	}
+	if strings.HasSuffix(modelPath, ".bsp") {
+		groups, err := renderer.BuildBSPItemMesh(idata, palette)
+		if err != nil || len(groups) == 0 {
+			log.Printf("item BSP parse failed: %s: %v", modelPath, err)
+			return renderer.ItemModel{}
+		}
+		total := 0
+		for _, g := range groups {
+			total += len(g.Verts) / 15
+		}
+		log.Printf("item BSP loaded:  %s (%d tris, %d textures)", modelPath, total, len(groups))
+		return renderer.ItemModel{Frames: [][]*renderer.WeaponMesh{groups}}
+	}
+	return renderer.ItemModel{}
+}
+
+// loadMDLAllFrames loads a monster MDL and returns an ItemModel with all animation frames.
+func loadMDLAllFrames(p pakReader, modelPath string, palette []byte) renderer.ItemModel {
+	mdata, err := p.ReadFile(modelPath)
+	if err != nil {
+		log.Printf("monster MDL not in PAK: %s", modelPath)
+		return renderer.ItemModel{}
+	}
+	mmdl, err := mdl.Load(mdata)
+	if err != nil {
+		log.Printf("monster MDL parse failed: %s: %v", modelPath, err)
+		return renderer.ItemModel{}
+	}
+	nf := mmdl.NumFrames()
+	if nf <= 0 {
+		nf = 1
+	}
+	texRGB := mmdl.SkinRGB(0, palette)
+	var frames [][]*renderer.WeaponMesh
+	for f := 0; f < nf; f++ {
+		verts := mmdl.BuildVerts(f)
+		if len(verts) == 0 || len(texRGB) == 0 {
+			frames = append(frames, nil)
+			continue
+		}
+		frames = append(frames, []*renderer.WeaponMesh{{
+			Verts:  verts,
+			TexRGB: texRGB,
+			TexW:   mmdl.SkinWidth,
+			TexH:   mmdl.SkinHeight,
+		}})
+	}
+	if len(frames) > 0 {
+		log.Printf("monster MDL loaded: %s (%d frames, %d tris)", modelPath, nf, len(frames[0][0].Verts)/15)
+	}
+	return renderer.ItemModel{Frames: frames}
 }
 
 func saveScreenshot(w, h int) {
@@ -395,7 +452,6 @@ func saveScreenshot(w, h int) {
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			i := (y*w + x) * 3
-			// Flip Y: OpenGL origin is bottom-left, image origin is top-left.
 			img.SetNRGBA(x, h-1-y, color.NRGBA{R: pixels[i], G: pixels[i+1], B: pixels[i+2], A: 255})
 		}
 	}

@@ -15,15 +15,15 @@ go run . -pak /path/to/id1/pak0.pak
 go run . -map /path/to/e1m1.bsp
 ```
 
-Controls: WASD to move, mouse to look, Space to jump, Escape to quit.
-Title bar shows current leaf index and player position.
+Controls: WASD to move, mouse to look, Space to jump, left-click to swing axe, Escape to quit.
+Title bar shows current HP, leaf index, and player position.
 
 ## package structure
 
 ```
 main.go              — LockOSThread, bus wiring, render loop
 game/
-  messages.go        — inter-goroutine message types (InputEvent, PlayerState, EntityState, RenderFrame)
+  messages.go        — inter-goroutine message types (InputEvent, PlayerState, EntityState, RenderFrame, ItemState)
   bus.go             — Bus struct with all channels
 bsp/
   types.go           — BSP29 on-disk structs (DLeaf, DNode, DFace, DEdge, DPlane, DModel)
@@ -37,11 +37,12 @@ vis/
   vis.go             — PVS RLE decompress, IsLeafVisible, LeafForPoint
 entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
-  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models); ParseMonsters, MonsterPath: maps monster_* classnames to MDL paths
+  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models); ParseMonsters, MonsterPath: maps monster_* classnames to MDL paths; ItemSpawn.HealthValue for health packs
+  monsters.go        — MonsterState runtime struct (Pos, VelZ, HP, Alerted, FrameIdx, AttackCooldown); NewMonsterState; AI constants
 mdl/
-  mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts, SkinRGB
+  mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts(frameIdx), SkinRGB, NumFrames
 renderer/
-  renderer.go        — GL init, world + entity VAO upload, skybox cube VAO, weapon VAO, draw loop
+  renderer.go        — GL init, world + entity VAO upload, multi-frame item/weapon VAOs, HUD bar, draw loop
   compute.go         — SSBO lifecycle, per-frame dispatch + barrier
   shaders/
     pvs_traverse.glsl  — compute shader: Quake RLE PVS decode on GPU, sets visibleFaceFlags[]
@@ -49,12 +50,14 @@ renderer/
     world.frag.glsl    — per-face texture from atlas; sky faces discard; water faces procedural; discards invisible faces
     skybox.vert.glsl   — passes cube vertex as vDir; sets gl_Position.z = w (depth = 1.0)
     skybox.frag.glsl   — procedural ominous sky: direction-based FBM clouds, horizon ember glow
-    weapon.vert.glsl   — view-space weapon transform: uProj * uWeaponMat * aPos
+    weapon.vert.glsl   — view-space weapon transform: uProj * uWeaponMat * aPos; also used for world items/monsters
     weapon.frag.glsl   — skin texture with grey desaturation + ambient dim to match world look
+    hud.vert.glsl      — emits NDC quad vertices, passes vUV across bar width
+    hud.frag.glsl      — health bar: discards pixels where vUV.x > uFrac; colour transitions green→red
 physics/
-  physics.go         — WASD + mouselook, gravity, jumping, BSP collision; own goroutine
+  physics.go         — WASD + mouselook, gravity, jumping, BSP collision, weapon swing, monster AI; own goroutine
 input/
-  input.go           — GLFW key/mouse snapshot pump
+  input.go           — GLFW key/mouse snapshot pump (keys + mouse buttons 0–7)
 ```
 
 ## channel architecture
@@ -65,7 +68,7 @@ input (main thread) → bus.Input → physics goroutine → bus.Physics → main
 
 - `bus.Input` unbuffered — honest backpressure on physics
 - `bus.Physics` / `bus.Render` buffered 1 — stale states are dropped, never queued
-- `bus.ItemPickups` buffered 16 — physics sends item indices on pickup; main drains each frame
+- `bus.ItemPickups` buffered 16 — physics sends item indices on pickup (items only); main drains each frame
 - `bus.Shutdown` closed to broadcast stop to all goroutines
 - GL must stay on the OS main thread (`runtime.LockOSThread` in `init()`)
 
@@ -90,6 +93,7 @@ State machine per entity: `Closed → Opening → Open → Closing → Closed`.
 - **func_door:** moves along `angle` direction by `(bbox_extent_along_dir − lip)` units; default speed=100, wait=3s
 - **func_plat:** geometry stored at top in BSP; starts at bottom (`offset = {0,0,−height}`), rises to top on trigger
 - **Collision:** `traceAll` in physics traces world hull + each entity's `HeadNodes[1]` hull (offset into entity local space); player cannot walk through closed/moving doors
+- **Monster collision:** `monsterMoveTrace` uses `HeadNodes[0]` (point hull) for both world and entities; monsters are blocked by closed doors
 - **Rendering:** per-entity VAO built at init from `Models[N]` faces; `uEntityOffset` uniform shifts vertices each frame
 
 ## skybox rendering
@@ -118,28 +122,65 @@ Water faces (BSP texture prefix `*`, brightness sentinel 3.0) bypass the atlas a
 
 ## view weapon rendering
 
-`progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. Frame 0 (idle) is built into a VAO with interleaved `x,y,z,u,v` (5 floats per vertex, no index buffer).
+`progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. All animation frames are built into separate VAOs (interleaved `x,y,z,u,v`, 5 floats per vertex, no index buffer). The skin texture is uploaded once and shared across frames.
 
-Draw order: world → brush entities → skybox → **weapon** (depth cleared before weapon draw so it is never occluded by world geometry).
+Draw order: world → brush entities → skybox → **weapon** (depth cleared before weapon draw) → **HUD**.
 
 The weapon is positioned in GL camera space via:
 - `RotX(-90) * RotZ(90)` — converts Quake view space (X=forward, -Y=right, Z=up) to GL camera space (-Z=forward, +X=right, +Y=up)
-- `Translate3D(16, -10, -25)` — places it in the lower-right of the view; tune `(right, up, forward)` in camera units
+- `Translate3D(16, -10, -25)` — places it in the lower-right of the view
 
-The fragment shader applies the same grey desaturation as `world.frag.glsl` (`mix(color, luma, 0.4)`) plus a fixed 0.72 ambient dim (no BSP lightmap for MDL models). If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
+The active VAO is selected each frame by `frame.Player.WeaponFrame`. If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
+
+## weapon swing
+
+Physics drives the axe animation in `tickWeapon`:
+- Left mouse button press (not already swinging) starts the swing at frame 1
+- Frames advance at 8 FPS; hit detection fires when `weaponFrame >= 2` (first time per swing)
+- `tryAxeHit` casts a 64-unit forward ray from eye position; monsters within 40 units of the ray tip take 25 damage
+- When the frame counter reaches `NumFrames`, the swing ends and the weapon returns to frame 0
 
 ## item pickup system
 
-Item spawns (weapons, armor, ammo, health, keys) are loaded from the BSP entity lump at startup into `itemSpawns []entities.ItemSpawn` and `itemStates []game.ItemState`. Monsters use the same `itemStates` slice but are appended after items (`numItems = len(itemSpawns)`).
+Item spawns (weapons, armor, ammo, health, keys) are loaded from the BSP entity lump at startup into `itemSpawns []entities.ItemSpawn` and `itemStates []game.ItemState`. Monsters are managed separately by physics and sent each frame via `PlayerState.MonsterItems`.
 
 **Pickup detection** runs in the physics goroutine:
 - After each movement tick, the player foot origin (`position − eyeHeight`) is checked against each unpicked item
 - Radius: 32 units (Quake standard)
-- On contact: index sent on `bus.ItemPickups` (non-blocking); `picked[i] = true` prevents double-pickup
+- On contact: if `item.HealthValue > 0` the player's HP is increased (capped at 100); index sent on `bus.ItemPickups` (non-blocking); `picked[i] = true` prevents double-pickup
 
-**Main loop** drains `bus.ItemPickups` each frame using a labeled `break` loop, marks `pickedItems[idx] = true`, then builds `visibleItems` by filtering out picked indices below `numItems`. Monster entries (`i >= numItems`) are always included.
+**Main loop** drains `bus.ItemPickups` each frame, marks `pickedItems[idx] = true`, then builds `visibleItems` from unpicked items plus `playerState.MonsterItems`.
 
-**Single-player rules**: no respawn. Items are gone permanently once picked.
+**Single-player rules**: no item respawn. Items are gone permanently once picked.
+
+## monster AI system
+
+Monster state lives entirely in `entities.MonsterState` slices owned by the physics goroutine. Each tick, `tickMonsters` runs:
+
+- **Animation:** `FrameIdx` advances at 10 FPS (wraps mod `NumFrames`)
+- **Alert:** if within 1024 units and `HullTrace` (point hull, world only) finds clear LOS to player foot, `Alerted = true`
+- **Chase:** when alerted and outside melee range, XY movement is traced via `monsterMoveTrace` (point hull, world + entities); blocked by closed doors and walls
+- **Gravity:** `VelZ` accumulates downward at 800 units/s²; vertical movement traced via `monsterMoveTrace`; `VelZ` resets to 0 on landing or ceiling impact
+- **Melee:** within 64 units, deals 10 damage per hit with 1.5 s cooldown
+- **Death:** `HP ≤ 0` sets `Dead = true`; monster is excluded from `MonsterItems` and disappears from the scene
+
+Live monsters are communicated to the renderer each frame as `PlayerState.MonsterItems []ItemState`, where each entry carries `Pos`, `MdlIdx`, and `Frame`. The renderer indexes into `itemVAOs[MdlIdx].frames[Frame]` to draw the correct animation frame.
+
+## player health and respawn
+
+- Player starts at 100 HP
+- Health packs restore 25 HP (normal) or 100 HP (megahealth), capped at 100
+- Monster melee deals 10 HP per hit
+- `PlayerState.Health` is published each physics tick; the HUD bar reads it
+- On death (`playerHP ≤ 0`): player teleports to spawn, velocity zeroed, HP reset to 100, all monsters un-alert
+
+## HUD health bar
+
+Drawn last (after weapon), depth test disabled. A static NDC quad covers the bottom strip of the screen (`y ∈ [−1, −0.97]`). The fragment shader discards pixels where `vUV.x > uFrac` where `uFrac = Health / 100.0`. Colour transitions from green (full health) to red (low health) as `uFrac` decreases.
+
+## multi-frame MDL rendering
+
+`renderer.ItemModel` holds `Frames [][]*WeaponMesh` — one slice of texture groups per animation frame. At `Init`, each MDL frame is uploaded as a separate VAO (same skin texture reused across frames). `itemRenderable.frames[frameIdx][groupIdx]` selects the right VAO at draw time. BSP sub-model items have a single frame. The weapon uses `[]weaponFrameData` (one VAO per frame, shared texture).
 
 ## special features
 
@@ -148,9 +189,11 @@ Item spawns (weapons, armor, ammo, health, keys) are loaded from the BSP entity 
 - Interactive doors and elevators: proximity-triggered state machines with BSP hull collision.
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics.
-- View weapon: `v_axe.mdl` rendered in camera space with matching grey aesthetic.
-- Item pickup: weapons, armor, ammo, health, and keys disappear on contact (32-unit sphere against player foot origin, single-player rules — no respawn). Pickup detection runs in the physics goroutine; events flow through `bus.ItemPickups` (buffered 16) to the main loop which filters the visible item list each frame.
-- Monster rendering: all 15 Quake monster types parsed from entity lump and rendered as static MDL models at spawn positions.
+- View weapon: `v_axe.mdl` rendered in camera space with full swing animation and hit detection.
+- Item pickup: weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP.
+- Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.
+- Player respawn: death teleports back to spawn with full HP and reset monster alert state.
+- HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
 
 ## current limitations / next steps
 
@@ -158,7 +201,8 @@ Item spawns (weapons, armor, ammo, health, keys) are loaded from the BSP entity 
 - No sound
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
 - BSP lightmap brightness computed (`bsp/lighting.go`) but not yet wired into the renderer SSBO
-- Weapon renders frame 0 only — no swing animation, no view bob
-- Monsters render frame 0 only — no AI, no animation, no collision, no death
-- Items render at spawn positions until touched; no respawn (single-player rules)
-- Monsters render at fixed spawn positions — no AI, no animation, no collision, no death
+- No view bob or weapon kick animation
+- Monster AI is purely melee — no ranged attacks, no projectiles
+- Monsters have no death animation (disappear instantly on HP ≤ 0)
+- No enemy variety in combat behaviour (all monsters use identical melee AI regardless of type)
+- Items do not respawn (single-player rules)

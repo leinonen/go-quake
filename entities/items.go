@@ -8,8 +8,9 @@ import (
 
 // ItemSpawn holds the world position and model path (.mdl or .bsp) for one item entity.
 type ItemSpawn struct {
-	Pos       [3]float32
-	ModelPath string
+	Pos         [3]float32
+	ModelPath   string
+	HealthValue int // >0 for health packs; amount of HP restored on pickup
 }
 
 // ParseItems returns all item spawns from a BSP entity lump.
@@ -25,7 +26,16 @@ func ParseItems(entityLump string) []ItemSpawn {
 		if err != nil {
 			continue
 		}
-		out = append(out, ItemSpawn{Pos: pos, ModelPath: path})
+		health := 0
+		if e.Fields["classname"] == "item_health" {
+			flags, _ := strconv.Atoi(e.Fields["spawnflags"])
+			if flags&2 != 0 {
+				health = 100 // megahealth
+			} else {
+				health = 25 // normal health
+			}
+		}
+		out = append(out, ItemSpawn{Pos: pos, ModelPath: path, HealthValue: health})
 	}
 	return out
 }

@@ -38,11 +38,17 @@ func Pump(window *glfw.Window, bus *game.Bus, lastTime *time.Time) {
 	dx := mx - cxf
 	dy := my - cyf
 
+	var mouseButtons [8]bool
+	for i := 0; i < 8; i++ {
+		mouseButtons[i] = window.GetMouseButton(glfw.MouseButton(i)) == glfw.Press
+	}
+
 	ev := game.InputEvent{
-		Keys:    keys,
-		MouseDX: dx,
-		MouseDY: dy,
-		Dt:      dt,
+		Keys:         keys,
+		MouseButtons: mouseButtons,
+		MouseDX:      dx,
+		MouseDY:      dy,
+		Dt:           dt,
 	}
 
 	// Non-blocking send: drop if physics is busy

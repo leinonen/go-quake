@@ -459,7 +459,8 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 			if frameIdx < 0 || frameIdx >= len(ir.frames) {
 				frameIdx = 0
 			}
-			itemMat := view.Mul4(mgl32.Translate3D(is.Pos[0], is.Pos[1], is.Pos[2]))
+			itemMat := view.Mul4(mgl32.Translate3D(is.Pos[0], is.Pos[1], is.Pos[2]).Mul4(
+				mgl32.HomogRotate3DZ(is.Yaw)))
 			gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &itemMat[0])
 			for _, g := range ir.frames[frameIdx] {
 				gl.BindTexture(gl.TEXTURE_2D, g.tex)

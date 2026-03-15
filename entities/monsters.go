@@ -1,18 +1,43 @@
 package entities
 
+import "strings"
+
+// AnimRange is an inclusive [Start, End] frame index range within an MDL.
+type AnimRange struct{ Start, End int }
+
+// Valid returns true if the range refers to at least one frame.
+func (r AnimRange) Valid() bool { return r.Start >= 0 && r.End >= r.Start }
+
+// MonsterAnimState is the current animation mode of a monster.
+type MonsterAnimState int
+
+const (
+	AnimIdle MonsterAnimState = iota
+	AnimRun
+	AnimPain
+	AnimDead
+)
+
 // MonsterState holds the runtime state for one monster instance.
 type MonsterState struct {
 	Spawn          ItemSpawn
 	Pos            [3]float32
 	VelZ           float32 // vertical velocity for gravity
 	HP             int
+	PrevHP         int
 	Dead           bool
 	Alerted        bool
 	FrameTime      float32
 	FrameIdx       int
 	NumFrames      int
-	MdlIdx         int     // index into renderer itemVAOs
+	MdlIdx         int // index into renderer itemVAOs
 	AttackCooldown float32
+	Yaw            float32 // facing angle in radians, updated while chasing
+	AnimState      MonsterAnimState
+	IdleRange      AnimRange
+	RunRange       AnimRange
+	PainRange      AnimRange
+	DeadRange      AnimRange
 }
 
 const (
@@ -25,16 +50,55 @@ const (
 )
 
 // NewMonsterState creates a runtime monster state from a spawn point.
-func NewMonsterState(sp ItemSpawn, mdlIdx, numFrames int) MonsterState {
-	nf := numFrames
+// frameNames are the per-frame animation names from the MDL (e.g. "stand1", "run3").
+func NewMonsterState(sp ItemSpawn, mdlIdx int, frameNames []string) MonsterState {
+	nf := len(frameNames)
 	if nf <= 0 {
 		nf = 1
 	}
+	all := AnimRange{0, nf - 1}
+	idle := findAnimRange(frameNames, "stand", "idle")
+	if !idle.Valid() {
+		idle = all
+	}
+	run := findAnimRange(frameNames, "run", "walk")
+	if !run.Valid() {
+		run = idle
+	}
+	pain := findAnimRange(frameNames, "pain")
+	dead := findAnimRange(frameNames, "death", "die", "dth")
+
 	return MonsterState{
 		Spawn:     sp,
 		Pos:       sp.Pos,
 		HP:        MonsterHP,
+		PrevHP:    MonsterHP,
 		NumFrames: nf,
 		MdlIdx:    mdlIdx,
+		FrameIdx:  idle.Start,
+		IdleRange: idle,
+		RunRange:  run,
+		PainRange: pain,
+		DeadRange: dead,
 	}
+}
+
+// findAnimRange scans frameNames for the first contiguous group whose names start
+// with any of the given prefixes, returning its [start, end] range.
+func findAnimRange(names []string, prefixes ...string) AnimRange {
+	for _, prefix := range prefixes {
+		start, end := -1, -1
+		for i, name := range names {
+			if strings.HasPrefix(name, prefix) {
+				if start < 0 {
+					start = i
+				}
+				end = i
+			}
+		}
+		if start >= 0 {
+			return AnimRange{Start: start, End: end}
+		}
+	}
+	return AnimRange{Start: -1, End: -1}
 }

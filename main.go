@@ -173,15 +173,16 @@ func main() {
 
 		// Load monster MDL models — all animation frames.
 		monsterSpawns := entities.ParseMonsters(m.Entities)
+		monsterFrameNames := map[string][]string{}
 		for _, sp := range monsterSpawns {
 			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
 				modelPathToIdx[sp.ModelPath] = len(itemModels)
-				im := loadMDLAllFrames(p, sp.ModelPath, palette)
+				im, names := loadMDLAllFrames(p, sp.ModelPath, palette)
+				monsterFrameNames[sp.ModelPath] = names
 				itemModels = append(itemModels, im)
 			}
 			mdlIdx := modelPathToIdx[sp.ModelPath]
-			nf := len(itemModels[mdlIdx].Frames)
-			monsterStates = append(monsterStates, entities.NewMonsterState(sp, mdlIdx, nf))
+			monsterStates = append(monsterStates, entities.NewMonsterState(sp, mdlIdx, monsterFrameNames[sp.ModelPath]))
 		}
 		log.Printf("monsters: %d spawns, %d unique models", len(monsterSpawns), len(modelPathToIdx)-len(itemSpawns))
 
@@ -407,17 +408,18 @@ func loadItemModel(p pakReader, modelPath string, palette []byte) renderer.ItemM
 	return renderer.ItemModel{}
 }
 
-// loadMDLAllFrames loads a monster MDL and returns an ItemModel with all animation frames.
-func loadMDLAllFrames(p pakReader, modelPath string, palette []byte) renderer.ItemModel {
+// loadMDLAllFrames loads a monster MDL and returns an ItemModel with all animation frames
+// plus the per-frame animation names (e.g. "stand1", "run3") for state-driven animation.
+func loadMDLAllFrames(p pakReader, modelPath string, palette []byte) (renderer.ItemModel, []string) {
 	mdata, err := p.ReadFile(modelPath)
 	if err != nil {
 		log.Printf("monster MDL not in PAK: %s", modelPath)
-		return renderer.ItemModel{}
+		return renderer.ItemModel{}, nil
 	}
 	mmdl, err := mdl.Load(mdata)
 	if err != nil {
 		log.Printf("monster MDL parse failed: %s: %v", modelPath, err)
-		return renderer.ItemModel{}
+		return renderer.ItemModel{}, nil
 	}
 	nf := mmdl.NumFrames()
 	if nf <= 0 {
@@ -441,7 +443,7 @@ func loadMDLAllFrames(p pakReader, modelPath string, palette []byte) renderer.It
 	if len(frames) > 0 {
 		log.Printf("monster MDL loaded: %s (%d frames, %d tris)", modelPath, nf, len(frames[0][0].Verts)/15)
 	}
-	return renderer.ItemModel{Frames: frames}
+	return renderer.ItemModel{Frames: frames}, mmdl.FrameNames()
 }
 
 func saveScreenshot(w, h int) {

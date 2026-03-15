@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strings"
 )
 
 const (
@@ -55,6 +56,7 @@ type MDL struct {
 	texCoords  []texCoord
 	triangles  []triangle
 	frames     [][][3]byte // [frameIdx][vertIdx] = packed [3]byte coords
+	frameNames []string    // per-frame animation name (e.g. "stand1", "run3", "death1")
 }
 
 // Load parses a Quake MDL file from raw bytes.
@@ -172,6 +174,7 @@ func readSingleFrame(r *bytes.Reader, m *MDL) error {
 	if _, err := r.Read(name[:]); err != nil {
 		return err
 	}
+	frameName := strings.TrimRight(string(name[:]), "\x00")
 	frame := make([][3]byte, m.hdr.NumVerts)
 	for j := range frame {
 		var tv trivertx
@@ -181,8 +184,12 @@ func readSingleFrame(r *bytes.Reader, m *MDL) error {
 		frame[j] = tv.V
 	}
 	m.frames = append(m.frames, frame)
+	m.frameNames = append(m.frameNames, frameName)
 	return nil
 }
+
+// FrameNames returns the per-frame animation names stored in the MDL (e.g. "stand1", "run3").
+func (m *MDL) FrameNames() []string { return m.frameNames }
 
 // BuildVerts returns interleaved x,y,z,u,v vertex data for one animation frame.
 // Produces 3 vertices per triangle (no index buffer), 5 floats each.

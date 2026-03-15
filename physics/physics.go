@@ -222,6 +222,7 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 			Pos:    mn.Pos,
 			MdlIdx: mn.MdlIdx,
 			Frame:  mn.FrameIdx,
+			Yaw:    mn.Yaw,
 		})
 	}
 }
@@ -290,8 +291,8 @@ func tryAxeHit(ps *physicsState) {
 		dz := mn.Pos[2] - tipZ
 		if dx*dx+dy*dy+dz*dz < hitRadius*hitRadius {
 			mn.HP -= 25
-			if mn.HP <= 0 {
-				mn.Dead = true
+			if mn.HP < 0 {
+				mn.HP = 0
 			}
 		}
 	}
@@ -312,15 +313,30 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 
 	for i := range ps.monsters {
 		mn := &ps.monsters[i]
+
+		// Transition to death animation when HP first hits zero.
+		if mn.HP <= 0 && mn.AnimState != entities.AnimDead && !mn.Dead {
+			mn.AnimState = entities.AnimDead
+			mn.FrameTime = 0
+			if mn.DeadRange.Valid() {
+				mn.FrameIdx = mn.DeadRange.Start
+			} else {
+				mn.Dead = true // no death animation available — remove immediately
+			}
+		}
+
 		if mn.Dead {
 			continue
 		}
 
-		// Advance animation frame
 		mn.FrameTime += dt * entities.MonsterFPS
-		for mn.FrameTime >= 1.0 {
-			mn.FrameTime -= 1.0
-			mn.FrameIdx = (mn.FrameIdx + 1) % mn.NumFrames
+
+		// Death animation plays once; hold on last frame then mark dead.
+		if mn.AnimState == entities.AnimDead {
+			if advanceOnce(&mn.FrameIdx, &mn.FrameTime, mn.DeadRange) {
+				mn.Dead = true
+			}
+			continue
 		}
 
 		// Compute distance to player
@@ -328,6 +344,51 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 		dy := playerFoot[1] - mn.Pos[1]
 		dz := playerFoot[2] - mn.Pos[2]
 		dist := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+
+		// Trigger pain animation on incoming damage.
+		if mn.HP < mn.PrevHP && mn.AnimState != entities.AnimPain {
+			if mn.PainRange.Valid() {
+				mn.AnimState = entities.AnimPain
+				mn.FrameIdx = mn.PainRange.Start
+				mn.FrameTime = 0
+			}
+		}
+		mn.PrevHP = mn.HP
+
+		// Advance pain animation; return to idle/run when it finishes.
+		if mn.AnimState == entities.AnimPain {
+			if advanceOnce(&mn.FrameIdx, &mn.FrameTime, mn.PainRange) {
+				if mn.Alerted {
+					mn.AnimState = entities.AnimRun
+					mn.FrameIdx = mn.RunRange.Start
+				} else {
+					mn.AnimState = entities.AnimIdle
+					mn.FrameIdx = mn.IdleRange.Start
+				}
+				mn.FrameTime = 0
+			}
+		} else {
+			// Choose run vs idle based on chase state.
+			desired := entities.AnimIdle
+			if mn.Alerted {
+				desired = entities.AnimRun
+			}
+			if desired != mn.AnimState {
+				mn.AnimState = desired
+				if desired == entities.AnimRun {
+					mn.FrameIdx = mn.RunRange.Start
+				} else {
+					mn.FrameIdx = mn.IdleRange.Start
+				}
+				mn.FrameTime = 0
+			}
+			// Advance looping animation.
+			if mn.AnimState == entities.AnimRun {
+				advanceLoop(&mn.FrameIdx, &mn.FrameTime, mn.RunRange)
+			} else {
+				advanceLoop(&mn.FrameIdx, &mn.FrameTime, mn.IdleRange)
+			}
+		}
 
 		// Alert check: LOS trace from monster to player (world only)
 		if !mn.Alerted && dist < 1024 {
@@ -338,7 +399,8 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 		}
 
 		if mn.Alerted && dist > entities.MonsterMeleeDist && dist > 0 {
-			// Chase: move XY toward player, checking collision against world + brush entities
+			// Face and chase toward player.
+			mn.Yaw = float32(math.Atan2(float64(dy), float64(dx)))
 			spd := entities.MonsterSpeed * dt
 			moveEnd := [3]float32{
 				mn.Pos[0] + dx/dist*spd,
@@ -399,6 +461,31 @@ func monsterMoveTrace(m *bsp.Map, brushEnts []*entities.BrushEntity, start, end 
 		}
 	}
 	return best
+}
+
+// advanceLoop advances frameIdx within the range, looping, consuming accumulated frameTime.
+func advanceLoop(idx *int, ft *float32, r entities.AnimRange) {
+	for *ft >= 1.0 {
+		*ft -= 1.0
+		*idx++
+		if *idx > r.End {
+			*idx = r.Start
+		}
+	}
+}
+
+// advanceOnce advances frameIdx toward r.End without looping, consuming accumulated frameTime.
+// Returns true when the last frame has been reached.
+func advanceOnce(idx *int, ft *float32, r entities.AnimRange) bool {
+	for *ft >= 1.0 {
+		*ft -= 1.0
+		if *idx < r.End {
+			*idx++
+		} else {
+			return true
+		}
+	}
+	return false
 }
 
 // slideMove moves origin by disp, sliding along surfaces on impact (2-pass).
@@ -505,6 +592,7 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 			Pos:    mn.Pos,
 			MdlIdx: mn.MdlIdx,
 			Frame:  mn.FrameIdx,
+			Yaw:    mn.Yaw,
 		})
 	}
 }

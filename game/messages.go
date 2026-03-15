@@ -29,11 +29,12 @@ type PlayerState struct {
 	MonsterItems []ItemState // live monster positions + frame indices (set by physics)
 }
 
-// ItemState carries the world position, mesh index, and animation frame for one item or monster.
+// ItemState carries the world position, mesh index, animation frame, and facing yaw for one item or monster.
 type ItemState struct {
 	Pos    [3]float32
 	MdlIdx int
 	Frame  int
+	Yaw    float32 // facing angle in radians (world Z rotation); 0 = +X direction
 }
 
 // RenderFrame is sent from coordinator to renderer each frame.

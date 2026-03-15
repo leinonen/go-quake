@@ -6,11 +6,35 @@ import (
 	"go-quake/bsp"
 )
 
+// Weapon type constants — index into the view weapon slot array.
+const (
+	WeaponNone            = 0
+	WeaponShotgun         = 1
+	WeaponSuperShotgun    = 2
+	WeaponNailgun         = 3
+	WeaponSuperNailgun    = 4
+	WeaponGrenadeLauncher = 5
+	WeaponRocketLauncher  = 6
+	WeaponLightning       = 7
+)
+
+// Ammo type constants — index into the ammo array.
+const (
+	AmmoNone    = 0
+	AmmoShells  = 1
+	AmmoNails   = 2
+	AmmoRockets = 3
+	AmmoCells   = 4
+)
+
 // ItemSpawn holds the world position and model path (.mdl or .bsp) for one item entity.
 type ItemSpawn struct {
 	Pos         [3]float32
 	ModelPath   string
 	HealthValue int // >0 for health packs; amount of HP restored on pickup
+	WeaponType  int // WeaponNone or WeaponShotgun..WeaponLightning
+	AmmoType    int // AmmoNone or AmmoShells..AmmoCells
+	AmmoAmount  int // amount granted on pickup
 }
 
 // ParseItems returns all item spawns from a BSP entity lump.
@@ -26,16 +50,76 @@ func ParseItems(entityLump string) []ItemSpawn {
 		if err != nil {
 			continue
 		}
+		flags, _ := strconv.Atoi(e.Fields["spawnflags"])
+
 		health := 0
 		if e.Fields["classname"] == "item_health" {
-			flags, _ := strconv.Atoi(e.Fields["spawnflags"])
 			if flags&2 != 0 {
 				health = 100 // megahealth
 			} else {
 				health = 25 // normal health
 			}
 		}
-		out = append(out, ItemSpawn{Pos: pos, ModelPath: path, HealthValue: health})
+
+		weaponType := WeaponNone
+		switch e.Fields["classname"] {
+		case "weapon_shotgun":
+			weaponType = WeaponShotgun
+		case "weapon_supershotgun":
+			weaponType = WeaponSuperShotgun
+		case "weapon_nailgun":
+			weaponType = WeaponNailgun
+		case "weapon_supernailgun":
+			weaponType = WeaponSuperNailgun
+		case "weapon_grenadelauncher":
+			weaponType = WeaponGrenadeLauncher
+		case "weapon_rocketlauncher":
+			weaponType = WeaponRocketLauncher
+		case "weapon_lightning":
+			weaponType = WeaponLightning
+		}
+
+		ammoType := AmmoNone
+		ammoAmount := 0
+		switch e.Fields["classname"] {
+		case "ammo_shells", "item_shells":
+			ammoType = AmmoShells
+			if flags&1 != 0 {
+				ammoAmount = 40
+			} else {
+				ammoAmount = 25
+			}
+		case "ammo_nails", "item_spikes":
+			ammoType = AmmoNails
+			if flags&1 != 0 {
+				ammoAmount = 50
+			} else {
+				ammoAmount = 25
+			}
+		case "ammo_rockets", "item_rockets":
+			ammoType = AmmoRockets
+			if flags&1 != 0 {
+				ammoAmount = 10
+			} else {
+				ammoAmount = 5
+			}
+		case "ammo_cells":
+			ammoType = AmmoCells
+			if flags&1 != 0 {
+				ammoAmount = 12
+			} else {
+				ammoAmount = 6
+			}
+		}
+
+		out = append(out, ItemSpawn{
+			Pos:         pos,
+			ModelPath:   path,
+			HealthValue: health,
+			WeaponType:  weaponType,
+			AmmoType:    ammoType,
+			AmmoAmount:  ammoAmount,
+		})
 	}
 	return out
 }

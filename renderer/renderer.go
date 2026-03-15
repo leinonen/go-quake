@@ -47,6 +47,17 @@ type WeaponMesh struct {
 	TexH   int
 }
 
+// WeaponModel holds all animation frames for one view weapon MDL (one mesh per frame, shared texture).
+type WeaponModel struct {
+	Frames []*WeaponMesh // [frameIdx]
+}
+
+// weaponRenderable holds the uploaded GL resources for one view weapon slot.
+type weaponRenderable struct {
+	frames []weaponFrameData
+	tex    uint32
+}
+
 // ItemModel holds all animation frames for one unique item or monster model.
 type ItemModel struct {
 	Frames [][]*WeaponMesh // [frameIdx] → texture groups
@@ -80,13 +91,12 @@ type Renderer struct {
 	skyMVPLoc  int32
 	skyTimeLoc int32
 
-	// view weapon — one VAO per animation frame, single shared texture
-	weaponProg   uint32
-	weaponFrames []weaponFrameData
-	weaponTex    uint32
-	weapProjLoc  int32
-	weapMatLoc   int32
-	weapTexLoc   int32
+	// view weapons — one weaponRenderable per slot (8 total), each with per-frame VAOs + texture
+	weaponProg  uint32
+	weapons     []weaponRenderable
+	weapProjLoc int32
+	weapMatLoc  int32
+	weapTexLoc  int32
 
 	// HUD health bar
 	hudProg    uint32
@@ -129,7 +139,7 @@ var skyboxVerts = [...]float32{
 
 // Init initialises GL state and uploads BSP geometry.
 // palette is 768 bytes (256 RGB triplets) from gfx/palette.lmp; nil uses index-as-grey fallback.
-// weapon is a slice of per-frame WeaponMesh (one per animation frame); nil/empty skips weapon rendering.
+// weapons is a slice of per-slot WeaponModel (8 slots, one per weapon type); nil/empty skips weapon rendering.
 // items is a slice of per-unique-model ItemModel for world item pickups and monsters; may be nil.
 func Init(m *bsp.Map,
 	vertSrc, fragSrc, computeSrc,
@@ -138,7 +148,7 @@ func Init(m *bsp.Map,
 	hudVertSrc, hudFragSrc,
 	partVertSrc, partFragSrc string,
 	palette []byte,
-	weapon []*WeaponMesh,
+	weapons []WeaponModel,
 	items []ItemModel) (*Renderer, error) {
 
 	prog, err := compileRender(vertSrc, fragSrc)
@@ -252,8 +262,8 @@ func Init(m *bsp.Map,
 	gl.Enable(gl.CULL_FACE)
 	gl.CullFace(gl.FRONT) // Quake front = clockwise
 
-	// Weapon/item shader — compile if either weapon frames or items are present
-	if len(weapon) > 0 || len(items) > 0 {
+	// Weapon/item shader — compile if either weapon slots or items are present
+	if len(weapons) > 0 || len(items) > 0 {
 		wp, err := compileRender(weapVertSrc, weapFragSrc)
 		if err != nil {
 			return nil, fmt.Errorf("compile weapon shaders: %w", err)
@@ -264,13 +274,14 @@ func Init(m *bsp.Map,
 		r.weapTexLoc = gl.GetUniformLocation(wp, gl.Str("uTex\x00"))
 	}
 
-	// View weapon — upload one VAO per animation frame, texture once from frame 0
-	if len(weapon) > 0 {
-		// Upload skin texture from first valid frame
-		for _, wf := range weapon {
+	// View weapons — upload one weaponRenderable per slot.
+	for _, wm := range weapons {
+		var wr weaponRenderable
+		// Upload skin texture from first valid frame.
+		for _, wf := range wm.Frames {
 			if wf != nil && len(wf.TexRGB) > 0 {
-				gl.GenTextures(1, &r.weaponTex)
-				gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
+				gl.GenTextures(1, &wr.tex)
+				gl.BindTexture(gl.TEXTURE_2D, wr.tex)
 				gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGB8, int32(wf.TexW), int32(wf.TexH), 0,
 					gl.RGB, gl.UNSIGNED_BYTE, unsafe.Pointer(&wf.TexRGB[0]))
 				gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
@@ -279,10 +290,10 @@ func Init(m *bsp.Map,
 				break
 			}
 		}
-		// Upload one VAO per frame
-		for _, wf := range weapon {
+		// Upload one VAO per animation frame.
+		for _, wf := range wm.Frames {
 			if wf == nil || len(wf.Verts) == 0 {
-				r.weaponFrames = append(r.weaponFrames, weaponFrameData{})
+				wr.frames = append(wr.frames, weaponFrameData{})
 				continue
 			}
 			var wvao, wvbo uint32
@@ -296,11 +307,12 @@ func Init(m *bsp.Map,
 			gl.EnableVertexAttribArray(1)
 			gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 20, 12)
 			gl.BindVertexArray(0)
-			r.weaponFrames = append(r.weaponFrames, weaponFrameData{
+			wr.frames = append(wr.frames, weaponFrameData{
 				vao:      wvao,
 				numVerts: int32(len(wf.Verts) / 5),
 			})
 		}
+		r.weapons = append(r.weapons, wr)
 	}
 
 	// Upload item model VAOs — each ItemModel has frames, each frame has texture groups.
@@ -557,37 +569,44 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 
 	// Draw view weapon on top of everything — clear depth so it is never
 	// occluded by world geometry.
-	if r.weaponProg != 0 && len(r.weaponFrames) > 0 {
-		gl.Clear(gl.DEPTH_BUFFER_BIT)
-		gl.Disable(gl.CULL_FACE)
-
-		// Select frame, clamped to valid range
-		wfIdx := frame.Player.WeaponFrame
-		if wfIdx < 0 || wfIdx >= len(r.weaponFrames) {
-			wfIdx = 0
+	if r.weaponProg != 0 && len(r.weapons) > 0 {
+		weaponSlot := frame.Player.CurrentWeapon
+		if weaponSlot < 0 || weaponSlot >= len(r.weapons) {
+			weaponSlot = 0
 		}
-		wf := r.weaponFrames[wfIdx]
-		if wf.vao != 0 {
-			rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
-			rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
-			rot := rotX.Mul4(rotZ)
-			trans := mgl32.Translate3D(16, -10, -25)
-			weaponMat := trans.Mul4(rot)
+		wr := r.weapons[weaponSlot]
 
-			gl.UseProgram(r.weaponProg)
-			gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
-			gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &weaponMat[0])
+		if len(wr.frames) > 0 {
+			gl.Clear(gl.DEPTH_BUFFER_BIT)
+			gl.Disable(gl.CULL_FACE)
 
-			gl.ActiveTexture(gl.TEXTURE0)
-			gl.BindTexture(gl.TEXTURE_2D, r.weaponTex)
-			gl.Uniform1i(r.weapTexLoc, 0)
+			wfIdx := frame.Player.WeaponFrame
+			if wfIdx < 0 || wfIdx >= len(wr.frames) {
+				wfIdx = 0
+			}
+			wf := wr.frames[wfIdx]
+			if wf.vao != 0 {
+				rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
+				rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
+				rot := rotX.Mul4(rotZ)
+				trans := mgl32.Translate3D(6, -10, -14)
+				weaponMat := trans.Mul4(rot)
 
-			gl.BindVertexArray(wf.vao)
-			gl.DrawArrays(gl.TRIANGLES, 0, wf.numVerts)
-			gl.BindVertexArray(0)
+				gl.UseProgram(r.weaponProg)
+				gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
+				gl.UniformMatrix4fv(r.weapMatLoc, 1, false, &weaponMat[0])
+
+				gl.ActiveTexture(gl.TEXTURE0)
+				gl.BindTexture(gl.TEXTURE_2D, wr.tex)
+				gl.Uniform1i(r.weapTexLoc, 0)
+
+				gl.BindVertexArray(wf.vao)
+				gl.DrawArrays(gl.TRIANGLES, 0, wf.numVerts)
+				gl.BindVertexArray(0)
+			}
+
+			gl.Enable(gl.CULL_FACE)
 		}
-
-		gl.Enable(gl.CULL_FACE)
 	}
 
 	// Draw HUD health bar — last, depth test disabled.

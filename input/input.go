@@ -24,6 +24,8 @@ func Pump(window *glfw.Window, bus *game.Bus, lastTime *time.Time) {
 		glfw.KeyUp, glfw.KeyDown,
 		glfw.KeySpace, glfw.KeyLeftControl, glfw.KeyC,
 		glfw.KeyEscape,
+		glfw.Key1, glfw.Key2, glfw.Key3, glfw.Key4,
+		glfw.Key5, glfw.Key6, glfw.Key7, glfw.Key8,
 	} {
 		if int(k) < 512 {
 			keys[k] = window.GetKey(k) == glfw.Press

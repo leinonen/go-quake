@@ -72,8 +72,8 @@ func main() {
 
 	var m *bsp.Map
 	var palette []byte
-	var weaponFrames []*renderer.WeaponMesh
-	var numWeaponFrames int
+	var allWeaponModels [8]renderer.WeaponModel
+	var weaponFrameCounts [8]int
 	var itemModels []renderer.ItemModel
 	var itemStates []game.ItemState
 	var itemSpawns []entities.ItemSpawn
@@ -104,34 +104,50 @@ func main() {
 		// Load palette for texture colour conversion
 		palette, _ = p.ReadFile("gfx/palette.lmp")
 
-		// Load view axe model — all animation frames
-		if axeData, err := p.ReadFile("progs/v_axe.mdl"); err == nil {
-			if axeMDL, err := mdl.Load(axeData); err == nil {
-				nf := axeMDL.NumFrames()
-				if nf <= 0 {
-					nf = 1
-				}
-				texRGB := axeMDL.SkinRGB(0, palette)
-				for f := 0; f < nf; f++ {
-					verts := axeMDL.BuildVerts(f)
-					if len(verts) > 0 && len(texRGB) > 0 {
-						weaponFrames = append(weaponFrames, &renderer.WeaponMesh{
-							Verts:  verts,
-							TexRGB: texRGB,
-							TexW:   axeMDL.SkinWidth,
-							TexH:   axeMDL.SkinHeight,
-						})
-					}
-				}
-				numWeaponFrames = len(weaponFrames)
-				if numWeaponFrames > 0 {
-					log.Printf("v_axe.mdl loaded: %d frames, %d tris, skin %dx%d",
-						numWeaponFrames, len(weaponFrames[0].Verts)/15,
-						axeMDL.SkinWidth, axeMDL.SkinHeight)
-				}
-			} else {
-				log.Printf("v_axe.mdl parse: %v", err)
+		// Load view weapon MDLs for all 8 weapon slots.
+		viewWeaponPaths := [8]string{
+			"progs/v_axe.mdl",   // 0 = Axe
+			"progs/v_shot.mdl",  // 1 = Shotgun
+			"progs/v_shot.mdl",  // 2 = Super Shotgun (same MDL)
+			"progs/v_nail.mdl",  // 3 = Nailgun
+			"progs/v_nail2.mdl", // 4 = Super Nailgun
+			"progs/v_rock.mdl",  // 5 = Grenade Launcher
+			"progs/v_rock2.mdl", // 6 = Rocket Launcher
+			"progs/v_light.mdl", // 7 = Lightning Gun
+		}
+		for slot, path := range viewWeaponPaths {
+			wdata, werr := p.ReadFile(path)
+			if werr != nil {
+				log.Printf("view weapon not in PAK: %s", path)
+				continue
 			}
+			wmdl, werr := mdl.Load(wdata)
+			if werr != nil {
+				log.Printf("view weapon parse %s: %v", path, werr)
+				continue
+			}
+			nf := wmdl.NumFrames()
+			if nf <= 0 {
+				nf = 1
+			}
+			texRGB := wmdl.SkinRGB(0, palette)
+			var frames []*renderer.WeaponMesh
+			for f := 0; f < nf; f++ {
+				verts := wmdl.BuildVerts(f)
+				if len(verts) > 0 && len(texRGB) > 0 {
+					frames = append(frames, &renderer.WeaponMesh{
+						Verts:  verts,
+						TexRGB: texRGB,
+						TexW:   wmdl.SkinWidth,
+						TexH:   wmdl.SkinHeight,
+					})
+				} else {
+					frames = append(frames, nil)
+				}
+			}
+			allWeaponModels[slot] = renderer.WeaponModel{Frames: frames}
+			weaponFrameCounts[slot] = nf
+			log.Printf("view weapon slot %d (%s): %d frames", slot, path, nf)
 		}
 
 		// Normalise: accept "e1m1", "e1m1.bsp", "maps/e1m1.bsp"
@@ -255,7 +271,7 @@ func main() {
 		weapVertSrc, weapFragSrc,
 		hudVertSrc, hudFragSrc,
 		partVertSrc, partFragSrc,
-		palette, weaponFrames, itemModels)
+		palette, allWeaponModels[:], itemModels)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)
 	}
@@ -264,7 +280,7 @@ func main() {
 	log.Printf("brush entities: %d (func_door/func_plat)", len(mgr.Entities))
 
 	bus := game.NewBus()
-	go physics.Run(m, mgr, bus, spawn, itemSpawns, monsterStates, numWeaponFrames)
+	go physics.Run(m, mgr, bus, spawn, itemSpawns, monsterStates, weaponFrameCounts)
 
 	playerState := game.PlayerState{Position: spawn, Health: 100}
 	pickedItems := make([]bool, len(itemSpawns))

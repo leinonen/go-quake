@@ -49,26 +49,39 @@ type physicsState struct {
 	weaponSwinging  bool
 	hitFired        bool
 	weaponNumFrames int
-	monsters        []entities.MonsterState
-	particles       [particleCount]particle
-	particleScratch []game.ParticleState // pre-alloc, reused each tick
-	nextFreeHint    int                  // amortised free-slot cursor
+	// multi-weapon state
+	currentWeapon     int
+	hasWeapon         [8]bool
+	ammo              [8]int // index 1=shells, 2=nails, 3=rockets, 4=cells
+	weaponFrameCounts [8]int
+	fireCooldown      float32
+	mouseWasDown      bool
+	monsters          []entities.MonsterState
+	particles         [particleCount]particle
+	particleScratch   []game.ParticleState // pre-alloc, reused each tick
+	nextFreeHint      int                  // amortised free-slot cursor
 }
+
+// ammo caps per type (indexed by entities.AmmoShells..AmmoCells)
+var ammoCaps = [8]int{0, 100, 200, 100, 100}
 
 // Run is the physics goroutine. It receives input events and emits player states.
 func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
-	items []entities.ItemSpawn, monsters []entities.MonsterState, numWeaponFrames int) {
+	items []entities.ItemSpawn, monsters []entities.MonsterState, weaponFrameCounts [8]int) {
 
 	ps := &physicsState{
 		player: game.PlayerState{
 			Position: spawn,
 			Health:   100,
 		},
-		playerHP:        100,
-		respawnPos:      spawn,
-		weaponNumFrames: numWeaponFrames,
-		monsters:        monsters,
+		playerHP:          100,
+		respawnPos:        spawn,
+		weaponNumFrames:   weaponFrameCounts[0], // axe
+		weaponFrameCounts: weaponFrameCounts,
+		currentWeapon:     0,
+		monsters:          monsters,
 	}
+	ps.hasWeapon[0] = true // axe always owned
 	ps.particleScratch = make([]game.ParticleState, 0, particleCount)
 	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
 
@@ -100,6 +113,32 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
 						ps.playerHP += item.HealthValue
 						if ps.playerHP > 100 {
 							ps.playerHP = 100
+						}
+					}
+					if item.WeaponType != entities.WeaponNone {
+						ps.hasWeapon[item.WeaponType] = true
+						ps.currentWeapon = item.WeaponType
+						ps.weaponNumFrames = ps.weaponFrameCounts[item.WeaponType]
+						ps.weaponFrame = 0
+						ps.weaponSwinging = false
+						ps.fireCooldown = 0
+						ps.mouseWasDown = false
+						// Grant Quake-standard starting ammo for this weapon.
+						wt := item.WeaponType
+						grantType := [8]int{0, entities.AmmoShells, entities.AmmoShells, entities.AmmoNails, entities.AmmoNails, entities.AmmoRockets, entities.AmmoRockets, entities.AmmoCells}
+						grantAmt := [8]int{0, 25, 5, 30, 30, 5, 5, 15}
+						at, amt := grantType[wt], grantAmt[wt]
+						if at != entities.AmmoNone {
+							ps.ammo[at] += amt
+							if ps.ammo[at] > ammoCaps[at] {
+								ps.ammo[at] = ammoCaps[at]
+							}
+						}
+					}
+					if item.AmmoType != entities.AmmoNone && item.AmmoAmount > 0 {
+						ps.ammo[item.AmmoType] += item.AmmoAmount
+						if item.AmmoType < len(ammoCaps) && ps.ammo[item.AmmoType] > ammoCaps[item.AmmoType] {
+							ps.ammo[item.AmmoType] = ammoCaps[item.AmmoType]
 						}
 					}
 					select {
@@ -235,6 +274,8 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 	// Publish game state to player state
 	ps.player.Health = ps.playerHP
 	ps.player.WeaponFrame = ps.weaponFrame
+	ps.player.CurrentWeapon = ps.currentWeapon
+	ps.player.WeaponAmmo = ps.ammo
 
 	// Build MonsterItems from live monsters
 	ps.player.MonsterItems = ps.player.MonsterItems[:0]
@@ -253,13 +294,80 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 	buildParticleItems(ps)
 }
 
-// tickWeapon advances axe animation and fires hit detection.
+// weaponAmmoReq is the {ammoType, minCost} needed to fire each weapon slot.
+var weaponAmmoReq = [8][2]int{
+	{entities.AmmoNone, 0},    // 0 axe
+	{entities.AmmoShells, 1},  // 1 shotgun
+	{entities.AmmoShells, 2},  // 2 super shotgun
+	{entities.AmmoNails, 1},   // 3 nailgun
+	{entities.AmmoNails, 2},   // 4 super nailgun
+	{entities.AmmoRockets, 1}, // 5 grenade launcher
+	{entities.AmmoRockets, 1}, // 6 rocket launcher
+	{entities.AmmoCells, 1},   // 7 lightning
+}
+
+// canFire reports whether the player has enough ammo to fire weapon slot w.
+func canFire(ps *physicsState, w int) bool {
+	at, cost := weaponAmmoReq[w][0], weaponAmmoReq[w][1]
+	return at == entities.AmmoNone || ps.ammo[at] >= cost
+}
+
+// autoSwitchWeapon switches to the best owned weapon below the current one that can fire.
+func autoSwitchWeapon(ps *physicsState) {
+	for slot := ps.currentWeapon - 1; slot >= 0; slot-- {
+		if ps.hasWeapon[slot] && canFire(ps, slot) {
+			ps.currentWeapon = slot
+			ps.weaponNumFrames = ps.weaponFrameCounts[slot]
+			ps.weaponFrame = 0
+			ps.weaponSwinging = false
+			ps.fireCooldown = 0
+			ps.mouseWasDown = false
+			return
+		}
+	}
+}
+
+// tickWeapon dispatches to the active weapon's tick and handles weapon switching.
 func tickWeapon(ps *physicsState, ev game.InputEvent, dt float32) {
+	// Weapon switching via keys 1–8.
+	for slot := 0; slot < 8; slot++ {
+		k := glfw.Key(int(glfw.Key1) + slot)
+		if int(k) < 512 && ev.Keys[k] && ps.hasWeapon[slot] && slot != ps.currentWeapon {
+			ps.currentWeapon = slot
+			ps.weaponNumFrames = ps.weaponFrameCounts[slot]
+			ps.weaponFrame = 0
+			ps.weaponSwinging = false
+			ps.fireCooldown = 0
+			ps.mouseWasDown = false
+		}
+	}
+
+	switch ps.currentWeapon {
+	case 0:
+		tickAxe(ps, ev, dt)
+	case 1, 2:
+		tickShotgun(ps, ev, dt)
+	case 3, 4:
+		tickNailgun(ps, ev, dt)
+	case 5, 6:
+		tickRocket(ps, ev, dt)
+	case 7:
+		tickLightning(ps, ev, dt)
+	}
+
+	// Auto-switch to lower-tier weapon when current weapon is out of ammo.
+	if ps.currentWeapon > 0 && !canFire(ps, ps.currentWeapon) {
+		autoSwitchWeapon(ps)
+	}
+}
+
+// tickAxe advances the axe swing animation and fires melee hit detection.
+func tickAxe(ps *physicsState, ev game.InputEvent, dt float32) {
 	if ps.weaponNumFrames <= 0 {
 		return
 	}
 
-	// Start a swing on left-click when not already swinging
+	// Start a swing on left-click when not already swinging.
 	if ev.MouseButtons[0] && !ps.weaponSwinging {
 		ps.weaponSwinging = true
 		ps.weaponFrame = 1
@@ -276,18 +384,194 @@ func tickWeapon(ps *physicsState, ev game.InputEvent, dt float32) {
 		ps.weaponFrameTime -= 1.0
 		ps.weaponFrame++
 
-		// Fire hit check
+		// Fire hit check.
 		if !ps.hitFired && ps.weaponFrame >= weaponHitFrame {
 			ps.hitFired = true
 			tryAxeHit(ps)
 		}
 
-		// Swing completion
+		// Swing completion.
 		if ps.weaponFrame >= ps.weaponNumFrames {
 			ps.weaponFrame = 0
 			ps.weaponSwinging = false
 			ps.hitFired = false
 			break
+		}
+	}
+}
+
+// tickShotgun handles semi-auto shotgun / super shotgun fire.
+func tickShotgun(ps *physicsState, ev game.InputEvent, dt float32) {
+	advanceRangedAnim(ps, dt, false)
+	mouseDown := ev.MouseButtons[0]
+	if mouseDown && !ps.mouseWasDown {
+		cost := 1
+		pellets := 6
+		spread := float32(0.06)
+		if ps.currentWeapon == entities.WeaponSuperShotgun {
+			cost = 2
+			pellets = 14
+			spread = 0.12
+		}
+		if ps.ammo[entities.AmmoShells] >= cost {
+			ps.ammo[entities.AmmoShells] -= cost
+			fireHitscan(ps, pellets, spread, 4)
+			startRangedAnim(ps)
+		}
+	}
+	ps.mouseWasDown = mouseDown
+}
+
+// tickNailgun handles full-auto nailgun / super nailgun fire.
+func tickNailgun(ps *physicsState, ev game.InputEvent, dt float32) {
+	advanceRangedAnim(ps, dt, true)
+	if !ev.MouseButtons[0] {
+		ps.fireCooldown = 0
+		ps.weaponSwinging = false
+		ps.weaponFrame = 0
+		return
+	}
+	ps.fireCooldown -= dt
+	if ps.fireCooldown > 0 {
+		return
+	}
+	cost := 1
+	damage := 9
+	if ps.currentWeapon == entities.WeaponSuperNailgun {
+		cost = 2
+		damage = 18
+	}
+	if ps.ammo[entities.AmmoNails] >= cost {
+		ps.ammo[entities.AmmoNails] -= cost
+		fireHitscan(ps, 1, 0, damage)
+		ps.fireCooldown = 0.1
+		startRangedAnim(ps)
+	}
+}
+
+// tickRocket handles semi-auto grenade / rocket launcher fire.
+func tickRocket(ps *physicsState, ev game.InputEvent, dt float32) { //nolint
+	advanceRangedAnim(ps, dt, false)
+	mouseDown := ev.MouseButtons[0]
+	if mouseDown && !ps.mouseWasDown {
+		damage := 100
+		if ps.currentWeapon == entities.WeaponRocketLauncher {
+			damage = 120
+		}
+		if ps.ammo[entities.AmmoRockets] > 0 {
+			ps.ammo[entities.AmmoRockets]--
+			fireHitscan(ps, 1, 0, damage)
+			startRangedAnim(ps)
+		}
+	}
+	ps.mouseWasDown = mouseDown
+}
+
+// tickLightning handles full-auto lightning gun fire.
+func tickLightning(ps *physicsState, ev game.InputEvent, dt float32) {
+	advanceRangedAnim(ps, dt, true)
+	if !ev.MouseButtons[0] {
+		ps.fireCooldown = 0
+		ps.weaponSwinging = false
+		ps.weaponFrame = 0
+		return
+	}
+	ps.fireCooldown -= dt
+	if ps.fireCooldown > 0 {
+		return
+	}
+	if ps.ammo[entities.AmmoCells] > 0 {
+		ps.ammo[entities.AmmoCells]--
+		fireHitscan(ps, 1, 0, 30)
+		ps.fireCooldown = 0.05
+		startRangedAnim(ps)
+	}
+}
+
+// startRangedAnim begins the fire animation if not already playing.
+func startRangedAnim(ps *physicsState) {
+	if !ps.weaponSwinging && ps.weaponNumFrames > 1 {
+		ps.weaponSwinging = true
+		ps.weaponFrame = 1
+		ps.weaponFrameTime = 0
+	}
+}
+
+// advanceRangedAnim advances weaponFrame for ranged weapons.
+// loop=true: loops animation while weaponSwinging; loop=false: plays once then stops.
+func advanceRangedAnim(ps *physicsState, dt float32, loop bool) {
+	if !ps.weaponSwinging || ps.weaponNumFrames <= 1 {
+		return
+	}
+	ps.weaponFrameTime += dt * weaponFPS
+	for ps.weaponFrameTime >= 1.0 {
+		ps.weaponFrameTime -= 1.0
+		ps.weaponFrame++
+		if ps.weaponFrame >= ps.weaponNumFrames {
+			if loop {
+				ps.weaponFrame = 1
+			} else {
+				ps.weaponFrame = 0
+				ps.weaponSwinging = false
+				break
+			}
+		}
+	}
+}
+
+// fireHitscan fires numPellets rays from the player eye with optional spread.
+// Each pellet tests all live monsters using a ray-vs-sphere closest-point check.
+func fireHitscan(ps *physicsState, numPellets int, spreadFactor float32, damage int) {
+	eyePos := [3]float32(ps.player.Position)
+	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
+	pitch := float64(mgl32.DegToRad(ps.player.Pitch))
+	baseFwdX := float32(math.Cos(pitch) * math.Cos(yaw))
+	baseFwdY := float32(math.Cos(pitch) * math.Sin(yaw))
+	baseFwdZ := float32(math.Sin(pitch))
+
+	const rayLen = 2048.0
+	const hitRadius = 40.0
+
+	for p := 0; p < numPellets; p++ {
+		dx, dy, dz := baseFwdX, baseFwdY, baseFwdZ
+		if spreadFactor > 0 && numPellets > 1 {
+			dx += (rand.Float32()*2 - 1) * spreadFactor
+			dy += (rand.Float32()*2 - 1) * spreadFactor
+			dz += (rand.Float32()*2 - 1) * spreadFactor
+			mag := float32(math.Sqrt(float64(dx*dx + dy*dy + dz*dz)))
+			if mag < 1e-6 {
+				mag = 1
+			}
+			dx /= mag
+			dy /= mag
+			dz /= mag
+		}
+
+		for i := range ps.monsters {
+			mn := &ps.monsters[i]
+			if mn.Dead {
+				continue
+			}
+			// Closest point on ray to monster center.
+			vx := mn.Pos[0] - eyePos[0]
+			vy := mn.Pos[1] - eyePos[1]
+			vz := mn.Pos[2] - eyePos[2]
+			t := vx*dx + vy*dy + vz*dz
+			if t < 0 {
+				t = 0
+			} else if t > rayLen {
+				t = rayLen
+			}
+			cx := eyePos[0] + dx*t - mn.Pos[0]
+			cy := eyePos[1] + dy*t - mn.Pos[1]
+			cz := eyePos[2] + dz*t - mn.Pos[2]
+			if cx*cx+cy*cy+cz*cz < hitRadius*hitRadius {
+				mn.HP -= damage
+				if mn.HP < 0 {
+					mn.HP = 0
+				}
+				emitBloodParticles(ps, mn.Pos, dx, dy, dz)
+			}
 		}
 	}
 }
@@ -718,6 +1002,8 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 
 	ps.player.Health = ps.playerHP
 	ps.player.WeaponFrame = ps.weaponFrame
+	ps.player.CurrentWeapon = ps.currentWeapon
+	ps.player.WeaponAmmo = ps.ammo
 	ps.player.MonsterItems = ps.player.MonsterItems[:0]
 	for _, mn := range ps.monsters {
 		if mn.Dead {

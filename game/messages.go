@@ -25,16 +25,18 @@ type ParticleState struct {
 
 // PlayerState is the authoritative player position/orientation sent from physics to coordinator.
 type PlayerState struct {
-	Position     mgl32.Vec3
-	Velocity     mgl32.Vec3
-	Yaw, Pitch   float32
-	LeafIndex    int
-	OnGround     bool
-	Entities     []EntityState
-	Health       int
-	WeaponFrame  int
-	MonsterItems []ItemState     // live monster positions + frame indices (set by physics)
-	Particles    []ParticleState // live blood particles (set by physics)
+	Position      mgl32.Vec3
+	Velocity      mgl32.Vec3
+	Yaw, Pitch    float32
+	LeafIndex     int
+	OnGround      bool
+	Entities      []EntityState
+	Health        int
+	WeaponFrame   int
+	CurrentWeapon int      // active weapon slot (0=axe, 1=shotgun, ...)
+	WeaponAmmo    [8]int   // ammo per type; index matches AmmoShells..AmmoCells constants
+	MonsterItems  []ItemState     // live monster positions + frame indices (set by physics)
+	Particles     []ParticleState // live blood particles (set by physics)
 }
 
 // ItemState carries the world position, mesh index, animation frame, and facing yaw for one item or monster.

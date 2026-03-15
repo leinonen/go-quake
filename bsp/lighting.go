@@ -8,8 +8,10 @@ import (
 // Special sentinel values returned in the brightness SSBO for non-lit faces.
 // The fragment shader branches on these to apply special colors.
 const (
-	brightnessSky   = 2.0 // sky texture → rendered blue by shader
-	brightnessWater = 3.0 // water texture (*) → rendered blue by shader
+	brightnessSky    = 2.0 // sky texture → rendered by skybox shader
+	brightnessWater  = 3.0 // water texture (*) → procedural water
+	brightnessLava   = 4.0 // lava texture (*lava*) → procedural lava
+	brightnessPortal = 5.0 // teleporter texture (*teleport) → procedural portal
 )
 
 // LightmapFaceInfo describes where a face's lightmap data lives in the atlas.
@@ -33,7 +35,7 @@ func BuildLightmapAtlas(m *Map) (pixels []byte, atlasW, atlasH int, infos []Ligh
 
 	for i, face := range m.Faces {
 		name := strings.ToLower(textureName(m, face))
-		if strings.HasPrefix(name, "sky") || strings.HasPrefix(name, "*") {
+		if strings.HasPrefix(name, "sky") || strings.HasPrefix(name, "*") { // water, lava, slime all start with *
 			// sentinel faces: point at fallback texel
 			continue
 		}
@@ -171,6 +173,12 @@ func faceBrightness(m *Map, face DFace) float32 {
 	name := strings.ToLower(textureName(m, face))
 	if strings.HasPrefix(name, "sky") {
 		return brightnessSky
+	}
+	if strings.HasPrefix(name, "*lava") {
+		return brightnessLava
+	}
+	if strings.HasPrefix(name, "*tele") {
+		return brightnessPortal
 	}
 	if strings.HasPrefix(name, "*") {
 		return brightnessWater

@@ -86,6 +86,75 @@ vec3 proceduralWater(vec2 texST) {
     return water;
 }
 
+// --- Procedural lava ---
+
+vec3 proceduralLava(vec2 texST) {
+    vec2 base = texST / 64.0;
+
+    float t = uTime * 0.6;
+    // Slow rolling warp — lava moves sluggishly
+    vec2 warp1 = vec2(sin(base.y * 1.8 + t * 0.7) * 0.10,
+                      sin(base.x * 1.4 + t * 0.5) * 0.10);
+    vec2 warp2 = vec2(sin(base.y * 2.9 - t * 0.4) * 0.06,
+                      sin(base.x * 2.3 + t * 0.8) * 0.06);
+
+    float w1 = fbm(base       + warp1);
+    float w2 = fbm(base * 1.3 + warp2 + vec2(5.1, 2.7));
+    float wave = (w1 + w2) * 0.5;
+
+    // Dark cooled crust → glowing molten orange-red
+    vec3 crustColor  = vec3(0.05, 0.01, 0.00);
+    vec3 hotColor    = vec3(0.85, 0.18, 0.01);
+    vec3 lava = mix(crustColor, hotColor, smoothstep(0.30, 0.65, wave));
+
+    // Bright yellow-white hotspot at the highest crests
+    float crest = smoothstep(0.62, 0.78, wave);
+    vec3 glow = vec3(1.0, 0.75, 0.10);
+    lava = mix(lava, glow, crest * 0.70);
+
+    // Add pulsing emissive shimmer so it looks self-lit
+    float pulse = 0.5 + 0.5 * sin(uTime * 1.3 + w1 * 6.2);
+    lava += vec3(0.08, 0.02, 0.00) * pulse * smoothstep(0.4, 0.6, wave);
+
+    return lava;
+}
+
+// --- Procedural portal ---
+
+vec3 proceduralPortal(vec2 texST) {
+    vec2 base = texST / 64.0;
+    float t = uTime;
+
+    // Divergence-free (curl) domain warp: rotate the sampling coords using
+    // perpendicular sine waves so the flow is rotational with no fixed centre.
+    // This tiles seamlessly because sin/cos are smooth everywhere.
+    float wx = sin(base.y * 2.1 - t * 1.1) * 0.20 + sin(base.y * 4.3 + t * 0.5) * 0.08;
+    float wy = cos(base.x * 1.9 + t * 0.9) * 0.20 + cos(base.x * 3.8 - t * 0.6) * 0.08;
+    vec2 swirl1 = base + vec2(wx, wy);
+
+    float wx2 = cos(base.y * 3.2 + t * 0.7) * 0.14;
+    float wy2 = sin(base.x * 2.7 - t * 1.3) * 0.14;
+    vec2 swirl2 = base + vec2(wx2, wy2) + vec2(3.7, 1.5);
+
+    float n1 = fbm(swirl1 * 1.8);
+    float n2 = fbm(swirl2 * 2.1);
+    float energy = (n1 + n2) * 0.5;
+
+    // Pulsing brightness so it feels alive
+    float pulse = 0.5 + 0.5 * sin(t * 1.8 + n1 * 5.0);
+
+    // void black → electric cyan/blue → violet → white-hot
+    vec3 col = mix(vec3(0.00, 0.00, 0.03), vec3(0.05, 0.25, 0.65), smoothstep(0.28, 0.55, energy));
+    col      = mix(col, vec3(0.50, 0.15, 0.95),                     smoothstep(0.52, 0.70, energy));
+    col      = mix(col, vec3(0.90, 0.85, 1.00),                     smoothstep(0.68, 0.82, energy) * pulse);
+
+    // Crackling arcs where both FBM layers peak simultaneously
+    float arc = smoothstep(0.72, 0.82, n1) * smoothstep(0.68, 0.78, n2);
+    col += vec3(0.70, 0.50, 1.00) * arc * 0.7;
+
+    return col;
+}
+
 // --- Main ---
 
 void main() {
@@ -103,8 +172,20 @@ void main() {
     }
 
     // Water faces (sentinel 3.0)
-    if (b >= 2.5) {
+    if (b >= 2.5 && b < 3.5) {
         fragColor = vec4(proceduralWater(vTexST), 1.0);
+        return;
+    }
+
+    // Lava faces (sentinel 4.0)
+    if (b >= 3.5 && b < 4.5) {
+        fragColor = vec4(proceduralLava(vTexST), 1.0);
+        return;
+    }
+
+    // Portal/teleporter faces (sentinel 5.0)
+    if (b >= 4.5) {
+        fragColor = vec4(proceduralPortal(vTexST), 1.0);
         return;
     }
 

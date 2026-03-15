@@ -28,6 +28,9 @@ const (
 	particleSpeed     = 350.0 // units/s base spray speed
 	particleSpread    = 1.4   // lateral cone factor
 	particleEmitCount = 80    // per hit
+
+	monsterSepRadius  = 28.0 // minimum XY distance between monster centers
+	monsterHullOffset = 24   // hull 1 bottom extent below entity origin (Quake standing hull)
 )
 
 // particle is an internal blood particle, owned by the physics goroutine.
@@ -719,18 +722,67 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 				mn.Pos[2],
 			}
 			tr := monsterMoveTrace(m, brushEnts, mn.Pos, moveEnd)
-			mn.Pos[0] = tr.EndPos[0]
-			mn.Pos[1] = tr.EndPos[1]
+			// Monster-to-monster separation: reject XY move if it would overlap another monster.
+			newX, newY := tr.EndPos[0], tr.EndPos[1]
+			overlap := false
+			for j := range ps.monsters {
+				if i == j || ps.monsters[j].Dead {
+					continue
+				}
+				ddx := newX - ps.monsters[j].Pos[0]
+				ddy := newY - ps.monsters[j].Pos[1]
+				if ddx*ddx+ddy*ddy < monsterSepRadius*monsterSepRadius {
+					overlap = true
+					break
+				}
+			}
+			if !overlap {
+				mn.Pos[0] = tr.EndPos[0]
+				mn.Pos[1] = tr.EndPos[1]
+			}
 		}
 
-		// Gravity: accumulate downward velocity and move Z
-		mn.VelZ -= gravity * dt
-		zEnd := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] + mn.VelZ*dt}
-		tr := monsterMoveTrace(m, brushEnts, mn.Pos, zEnd)
-		mn.Pos[2] = tr.EndPos[2]
-		if tr.Hit {
-			if tr.Normal[2] > 0.7 || tr.Normal[2] < -0.7 {
+		// Gravity and ground snapping.
+		//
+		// monsterMoveTrace uses m.ClipNodes with HeadNodes[0]==0, which is the root
+		// of hull 1 (the player standing hull, 32×32×56). Hull 1 pre-expands solid
+		// surfaces 24 units upward (|mins[2]|), so the solid boundary in clip-node
+		// space sits at actual_floor_z + monsterHullOffset. Consequences:
+		//   • Traces starting below this boundary (e.g. monster origin at floor_z)
+		//     are StartSolid → Hit=false → gravity and wall detection break entirely.
+		//   • The correct physics resting position is floor_z + monsterHullOffset,
+		//     exactly where Quake's SV_DropToFloor places entity origins. MDL meshes
+		//     have their feet at approx z = -monsterHullOffset in model space, so
+		//     rendering at this origin puts feet visually at floor_z.
+		//
+		// Fix: always start vertical traces monsterHullOffset+1 above mn.Pos so the
+		// origin is safely above the expanded solid boundary. Do NOT subtract the
+		// offset from EndPos — mn.Pos should stay at floor_z+24 as the physics origin.
+		liftedZ := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] + monsterHullOffset + 1}
+		if mn.OnGround {
+			// Step-down: keep the monster glued to sloped or stepped floors.
+			groundEnd := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] - 8}
+			gtr := monsterMoveTrace(m, brushEnts, liftedZ, groundEnd)
+			if gtr.Hit && gtr.Normal[2] > 0.7 {
+				mn.Pos[2] = gtr.EndPos[2]
 				mn.VelZ = 0
+			} else {
+				mn.OnGround = false // walked off a ledge
+			}
+		} else {
+			mn.VelZ -= gravity * dt
+			zEnd := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] + mn.VelZ*dt}
+			tr := monsterMoveTrace(m, brushEnts, liftedZ, zEnd)
+			if tr.Hit {
+				mn.Pos[2] = tr.EndPos[2]
+				if tr.Normal[2] > 0.7 {
+					mn.VelZ = 0
+					mn.OnGround = true
+				} else if tr.Normal[2] < -0.7 {
+					mn.VelZ = 0 // hit ceiling
+				}
+			} else {
+				mn.Pos[2] = zEnd[2]
 			}
 		}
 
@@ -856,7 +908,7 @@ func monsterMoveTrace(m *bsp.Map, brushEnts []*entities.BrushEntity, start, end 
 	best := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, start, end)
 	for _, ent := range brushEnts {
 		entModel := m.Models[ent.ModelIndex]
-		entHull := entModel.HeadNodes[0]
+		entHull := entModel.HeadNodes[1] // HeadNodes[1] = hull-1 clip root; HeadNodes[0] is the render-BSP root (wrong array)
 		mo := entModel.Origin
 		adjStart := [3]float32{
 			start[0] - mo[0] - ent.Offset[0],

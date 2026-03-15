@@ -26,6 +26,7 @@ type MonsterState struct {
 	HP             int
 	PrevHP         int
 	Dead           bool
+	OnGround       bool
 	Alerted        bool
 	FrameTime      float32
 	FrameIdx       int

@@ -83,17 +83,19 @@ func NewMonsterState(sp ItemSpawn, mdlIdx int, frameNames []string) MonsterState
 	}
 }
 
-// findAnimRange scans frameNames for the first contiguous group whose names start
-// with any of the given prefixes, returning its [start, end] range.
+// findAnimRange scans frameNames for the first contiguous group whose names match
+// any of the given prefixes immediately followed by a digit, returning its [start, end] range.
 func findAnimRange(names []string, prefixes ...string) AnimRange {
 	for _, prefix := range prefixes {
 		start, end := -1, -1
 		for i, name := range names {
-			if strings.HasPrefix(name, prefix) {
+			if animPrefixMatch(name, prefix) {
 				if start < 0 {
 					start = i
 				}
 				end = i
+			} else if start >= 0 {
+				break // stop at the first gap — only the first contiguous block
 			}
 		}
 		if start >= 0 {
@@ -101,4 +103,14 @@ func findAnimRange(names []string, prefixes ...string) AnimRange {
 		}
 	}
 	return AnimRange{Start: -1, End: -1}
+}
+
+// animPrefixMatch returns true when name starts with prefix followed immediately by a digit.
+// This prevents "die" from matching "dieb1" or "death" from matching "deathc1".
+func animPrefixMatch(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	rest := name[len(prefix):]
+	return len(rest) > 0 && rest[0] >= '0' && rest[0] <= '9'
 }

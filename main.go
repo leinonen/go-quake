@@ -78,6 +78,7 @@ func main() {
 	var itemStates []game.ItemState
 	var itemSpawns []entities.ItemSpawn
 	var monsterStates []entities.MonsterState
+	var flameStates []entities.FlameState
 
 	switch {
 	case *pakPath != "":
@@ -208,6 +209,27 @@ func main() {
 		}
 		log.Printf("monsters: %d spawns, %d unique models", len(monsterSpawns), len(modelPathToIdx)-len(itemSpawns))
 
+		// Load flame MDL models — all animation frames.
+		flameSpawns := entities.ParseFlames(m.Entities)
+		for _, sp := range flameSpawns {
+			if _, seen := modelPathToIdx[sp.ModelPath]; !seen {
+				modelPathToIdx[sp.ModelPath] = len(itemModels)
+				im, _ := loadMDLAllFrames(p, sp.ModelPath, palette)
+				itemModels = append(itemModels, im)
+			}
+			mdlIdx := modelPathToIdx[sp.ModelPath]
+			nf := len(itemModels[mdlIdx].Frames)
+			if nf <= 0 {
+				nf = 1
+			}
+			flameStates = append(flameStates, entities.FlameState{
+				Pos:       sp.Pos,
+				MdlIdx:    mdlIdx,
+				NumFrames: nf,
+			})
+		}
+		log.Printf("flames: %d spawns", len(flameStates))
+
 	case *mapName != "":
 		// Direct .bsp file
 		var err error
@@ -280,7 +302,7 @@ func main() {
 	log.Printf("brush entities: %d (func_door/func_plat)", len(mgr.Entities))
 
 	bus := game.NewBus()
-	go physics.Run(m, mgr, bus, spawn, itemSpawns, monsterStates, weaponFrameCounts)
+	go physics.Run(m, mgr, bus, spawn, itemSpawns, monsterStates, flameStates, weaponFrameCounts)
 
 	playerState := game.PlayerState{Position: spawn, Health: 100}
 	pickedItems := make([]bool, len(itemSpawns))

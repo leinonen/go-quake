@@ -60,6 +60,7 @@ type physicsState struct {
 	fireCooldown      float32
 	mouseWasDown      bool
 	monsters          []entities.MonsterState
+	flames            []entities.FlameState
 	particles         [particleCount]particle
 	particleScratch   []game.ParticleState // pre-alloc, reused each tick
 	nextFreeHint      int                  // amortised free-slot cursor
@@ -70,7 +71,8 @@ var ammoCaps = [8]int{0, 100, 200, 100, 100}
 
 // Run is the physics goroutine. It receives input events and emits player states.
 func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
-	items []entities.ItemSpawn, monsters []entities.MonsterState, weaponFrameCounts [8]int) {
+	items []entities.ItemSpawn, monsters []entities.MonsterState,
+	flames []entities.FlameState, weaponFrameCounts [8]int) {
 
 	ps := &physicsState{
 		player: game.PlayerState{
@@ -83,6 +85,7 @@ func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
 		weaponFrameCounts: weaponFrameCounts,
 		currentWeapon:     0,
 		monsters:          monsters,
+		flames:            flames,
 	}
 	ps.hasWeapon[0] = true // axe always owned
 	ps.particleScratch = make([]game.ParticleState, 0, particleCount)
@@ -261,6 +264,7 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 
 	// Particle tick
 	tickParticles(m, ps, dt)
+	tickFlames(ps, dt)
 
 	// Respawn on death
 	if ps.playerHP <= 0 {
@@ -291,6 +295,13 @@ func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEven
 			MdlIdx: mn.MdlIdx,
 			Frame:  mn.FrameIdx,
 			Yaw:    mn.Yaw,
+		})
+	}
+	for _, f := range ps.flames {
+		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
+			Pos:    f.Pos,
+			MdlIdx: f.MdlIdx,
+			Frame:  f.FrameIdx,
 		})
 	}
 
@@ -834,6 +845,21 @@ func emitBloodParticles(ps *physicsState, origin [3]float32, fwdX, fwdY, fwdZ fl
 	}
 }
 
+// tickFlames advances flame animation frames (looping, no AI or physics).
+func tickFlames(ps *physicsState, dt float32) {
+	for i := range ps.flames {
+		f := &ps.flames[i]
+		f.FrameTime += dt * entities.MonsterFPS
+		for f.FrameTime >= 1.0 {
+			f.FrameTime -= 1.0
+			f.FrameIdx++
+			if f.FrameIdx >= f.NumFrames {
+				f.FrameIdx = 0
+			}
+		}
+	}
+}
+
 // tickParticles advances all active particles for one physics tick.
 func tickParticles(m *bsp.Map, ps *physicsState, dt float32) {
 	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
@@ -1051,6 +1077,7 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 	tickWeapon(ps, ev, dt)
 	tickMonsters(m, nil, ps, dt)
 	tickParticles(m, ps, dt)
+	tickFlames(ps, dt)
 
 	ps.player.Health = ps.playerHP
 	ps.player.WeaponFrame = ps.weaponFrame
@@ -1066,6 +1093,13 @@ func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
 			MdlIdx: mn.MdlIdx,
 			Frame:  mn.FrameIdx,
 			Yaw:    mn.Yaw,
+		})
+	}
+	for _, f := range ps.flames {
+		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
+			Pos:    f.Pos,
+			MdlIdx: f.MdlIdx,
+			Frame:  f.FrameIdx,
 		})
 	}
 

@@ -178,6 +178,33 @@ func ParseMonsters(entityLump string) []ItemSpawn {
 	return out
 }
 
+// FlamePath returns the MDL path for a flame light entity classname, or "".
+func FlamePath(classname string) string {
+	switch classname {
+	case "light_flame_large_yellow", "light_flame_small_yellow",
+		"light_flame_large_white", "light_flame_small_white":
+		return "progs/flame2.mdl"
+	}
+	return ""
+}
+
+// ParseFlames returns all flame spawns from a BSP entity lump.
+func ParseFlames(entityLump string) []ItemSpawn {
+	var out []ItemSpawn
+	for _, e := range bsp.ParseEntities(entityLump) {
+		path := FlamePath(e.Fields["classname"])
+		if path == "" {
+			continue
+		}
+		pos, err := bsp.ParseVec3(e.Fields["origin"])
+		if err != nil {
+			continue
+		}
+		out = append(out, ItemSpawn{Pos: pos, ModelPath: path})
+	}
+	return out
+}
+
 // ItemPath returns the PAK model path for a BSP entity, or "" if not a renderable item.
 func ItemPath(e bsp.Entity) string {
 	flags, _ := strconv.Atoi(e.Fields["spawnflags"])

@@ -37,8 +37,8 @@ vis/
   vis.go             — PVS RLE decompress, IsLeafVisible, LeafForPoint
 entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
-  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models); ParseMonsters, MonsterPath: maps monster_* classnames to MDL paths; ItemSpawn.HealthValue for health packs
-  monsters.go        — MonsterState runtime struct (Pos, VelZ, HP, Alerted, FrameIdx, AttackCooldown); NewMonsterState; AI constants
+  items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models); ParseMonsters, MonsterPath: maps monster_* classnames to MDL paths; FlamePath, ParseFlames: maps light_flame_* classnames to flame2.mdl; ItemSpawn.HealthValue for health packs
+  monsters.go        — MonsterState runtime struct (Pos, VelZ, HP, Alerted, FrameIdx, AttackCooldown); NewMonsterState; FlameState runtime struct (Pos, MdlIdx, FrameIdx, FrameTime, NumFrames); AI constants
 mdl/
   mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts(frameIdx), SkinRGB, NumFrames
 renderer/
@@ -222,6 +222,7 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Player respawn: death teleports back to spawn with full HP and reset monster alert state.
 - HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
 - Blood particles: axe hits spray ~80 physics-simulated GL_POINTS in a wide cone; pool of 2048; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
+- Flame entities: `light_flame_large_yellow`, `light_flame_small_yellow`, `light_flame_large_white`, `light_flame_small_white` parsed from the entity lump; rendered as looping `flame2.mdl` animation via the existing `itemVAOs` path; no AI, no collision, no pickup.
 
 ## blood particle system
 
@@ -239,6 +240,22 @@ Pool of 2048 `particle` structs owned by the physics goroutine (`physics/physics
 - Speed: `350 * rand(0.5..1.0)` units/s
 
 Live particles flow to the renderer via `PlayerState.Particles []ParticleState` (normalised life + stuck flag). Renderer packs 5 floats per particle (x,y,z,life,stuck) into a dynamic VBO each frame.
+
+## flame entity system
+
+`light_flame_large_yellow`, `light_flame_small_yellow`, `light_flame_large_white`, `light_flame_small_white` are decorative fire entities found in maps like `start`. They all share `progs/flame2.mdl`.
+
+**Loading** (in `main.go`, after monster loading):
+- `entities.ParseFlames(m.Entities)` extracts flame spawns from the entity lump
+- Each unique MDL path is loaded with `loadMDLAllFrames` and added to `itemModels` (shared `modelPathToIdx` deduplicates across items/monsters/flames)
+- A `FlameState` is created per spawn with `Pos`, `MdlIdx`, and `NumFrames`; no MDL frame names needed (no AI state machine)
+
+**Animation** (`tickFlames` in `physics/physics.go`):
+- Called each tick in both `tick()` and `noclip()` after `tickParticles`
+- `FrameTime += dt * MonsterFPS`; wraps `FrameIdx` mod `NumFrames`
+- Purely time-driven — no gravity, no collision, no alert radius
+
+**Rendering**: flames are appended to `PlayerState.MonsterItems` each tick (after monsters), using the same `game.ItemState{Pos, MdlIdx, Frame}` struct. The renderer draws them identically to item/monster MDLs with no changes required.
 
 ## current limitations / next steps
 

@@ -41,6 +41,16 @@ type MonsterState struct {
 	DeadRange      AnimRange
 }
 
+// FlameState holds runtime animation state for one flame entity.
+// Flames are purely decorative: no AI, no gravity, no collision.
+type FlameState struct {
+	Pos       [3]float32
+	MdlIdx    int
+	FrameIdx  int
+	FrameTime float32
+	NumFrames int
+}
+
 const (
 	MonsterHP             = 30
 	MonsterSpeed          = 150.0

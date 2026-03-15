@@ -45,6 +45,7 @@ go run . -map /path/to/e1m1.bsp
 - **Procedural water** — sin-warp turbulence + caustic glints replace Quake water textures
 - **View weapon** — `v_axe.mdl` rendered in camera space with full swing animation
 - **Item pickup** — weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP
+- **Flame entities** — `light_flame_*` classnames parsed and rendered as animated `flame2.mdl`; purely decorative, no AI or collision
 - **Monster AI** — all 15 Quake monster types animate, alert on line-of-sight, chase, and melee attack; blocked by closed doors; subject to gravity
 - **Blood particles** — axe hits spray ~80 physics-simulated particles in a wide cone; particles arc with gravity, splat on walls and floors, then fade out
 - **Combat** — left-click attacks with the active weapon: axe (melee swing, hit at frame 2), shotgun/super shotgun (hitscan pellets with spread), nailgun/super nailgun (full-auto hitscan), rocket/grenade launcher, lightning gun; weapons switched with keys 1–8

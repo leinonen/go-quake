@@ -2,12 +2,13 @@
 
 Minimalistic Quake 1 engine written in Go. Loads real BSP29 maps and renders them with a compute shader PVS pipeline.
 
-![screenshot](./docs/screenshot_20260315_153352.png)
+![screenshot](./docs/screenshot.png)
 
 ## Requirements
 
 - Go 1.21+
 - OpenGL 4.3
+- OpenAL (`libopenal` — `apt install libopenal-dev` or equivalent)
 - A Quake 1 installation (for PAK file) or a loose `.bsp` file
 
 ## Running
@@ -51,6 +52,7 @@ go run . -map /path/to/e1m1.bsp
 - **Combat** — left-click attacks with the active weapon: axe (melee swing, hit at frame 2), shotgun/super shotgun (hitscan pellets with spread), nailgun/super nailgun (full-auto hitscan), rocket/grenade launcher, lightning gun; weapons switched with keys 1–8
 - **Player health** — starts at 100 HP; monsters deal 10 damage per hit; health bar at screen bottom; death teleports back to spawn
 - **Respawn** — on death the player resets to spawn, HP restores to 100, and all monsters un-alert
+- **Sound** — OpenAL audio for weapon fire (axe swing/hit, all 7 hitscan weapons), item pickup, and per-monster death cries; 16-source pool; missing sounds silently skipped
 
 ## License
 

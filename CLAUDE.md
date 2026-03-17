@@ -39,6 +39,9 @@ entities/
   entities.go        — BrushEntity state machines (func_door, func_plat); Manager.Update, Manager.States
   items.go           — ParseItems, ItemPath: maps item classnames to PAK model paths (MDL + BSP sub-models); ParseMonsters, MonsterPath: maps monster_* classnames to MDL paths; FlamePath, ParseFlames: maps light_flame_* classnames to flame2.mdl; ItemSpawn.HealthValue for health packs
   monsters.go        — MonsterState runtime struct (Pos, VelZ, HP, Alerted, FrameIdx, AttackCooldown); NewMonsterState; FlameState runtime struct (Pos, MdlIdx, FrameIdx, FrameTime, NumFrames); AI constants
+sound/
+  sound.go           — OpenAL Manager: Init/Cleanup, 16-source pool, Play(SoundEvent), PlayPath(pakPath); missing files silently skipped
+  wav.go             — RIFF/WAV decoder: 8/16-bit mono/stereo PCM → OpenAL buffer
 mdl/
   mdl.go             — Quake MDL v6 parser: skins, texcoords, triangles, frames; BuildVerts(frameIdx), SkinRGB, NumFrames
 renderer/
@@ -233,6 +236,7 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
 - Blood particles: axe hits spray ~80 physics-simulated GL_POINTS in a wide cone; pool of 2048; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
 - Flame entities: `light_flame_large_yellow`, `light_flame_small_yellow`, `light_flame_large_white`, `light_flame_small_white` parsed from the entity lump; rendered as looping `flame2.mdl` animation via the existing `itemVAOs` path; no AI, no collision, no pickup.
+- Sound: OpenAL audio for all weapons (axe, shotgun, super shotgun, nailgun, super nailgun, rocket, grenade, lightning), item pickup, and per-monster death cries; 16-source pool; accumulated in physics goroutine and drained by main each frame; silently skipped if PAK or OpenAL unavailable.
 
 ## blood particle system
 
@@ -267,10 +271,23 @@ Live particles flow to the renderer via `PlayerState.Particles []ParticleState` 
 
 **Rendering**: flames are appended to `PlayerState.MonsterItems` each tick (after monsters), using the same `game.ItemState{Pos, MdlIdx, Frame}` struct. The renderer draws them identically to item/monster MDLs with no changes required.
 
+## sound system
+
+OpenAL-based audio via cgo (`-lopenal`). All sounds are loaded from the PAK file at startup; missing files are silently skipped so the engine runs without audio on systems without a PAK or OpenAL.
+
+**Sound events** (`sound.SoundEvent` enum):
+- Weapon fire: `SndAxeSwing`, `SndAxeHit`, `SndShotgun`, `SndSuperShotgun`, `SndNailgun`, `SndSuperNailgun`, `SndRocket`, `SndGrenade`, `SndLightning`
+- `SndItemPickup` — any item contact
+
+**Monster death sounds**: path-keyed via `entities.MonsterDeathSound(mdlPath)` → `monsterDeathSounds` map (soldier, dog, etc.). Loaded at startup via `sound.PreloadPaths`; played via `sound.PlayPath(path)`.
+
+**Integration**: physics goroutine accumulates `PlayerState.SoundEvents []SoundEvent` and `PlayerState.SoundPaths []string` during each tick; main loop drains both slices each frame and calls `sound.Play` / `sound.PlayPath`.
+
+**Source pool**: 16 pre-allocated `ALuint` sources. `playBuf` finds a stopped/initial source; if all are busy the sound is silently dropped (non-blocking).
+
 ## current limitations / next steps
 
 - `CountVisible()` does a GPU→CPU readback every 30 frames (debug only); replace with `glMultiDrawArraysIndirect` for fully GPU-resident pipeline
-- No sound
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
 - No view bob or weapon kick animation
 - Monster AI is purely melee — no ranged attacks, no projectiles

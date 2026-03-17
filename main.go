@@ -439,6 +439,17 @@ func loadHUDAssets(p pakReader, palette []byte) *renderer.HUDAssets {
 		a.Faces[i] = img
 	}
 
+	// Weapon icons: generated custom icons (dim = unowned, lit = owned).
+	for i := range a.WeaponsDim {
+		a.WeaponsDim[i] = gfx.GenerateWeaponIcon(i, false)
+		a.WeaponsLit[i] = gfx.GenerateWeaponIcon(i, true)
+	}
+
+	// Small ammo digits.
+	for i := 0; i <= 9; i++ {
+		a.SmallNums[i] = gfx.GenerateSmallDigit(i)
+	}
+
 	log.Printf("HUD assets loaded (sbar=%v, nums=%v, faces=%v)",
 		a.SBar != nil,
 		func() int {

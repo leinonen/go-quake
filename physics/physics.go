@@ -417,6 +417,27 @@ func (p *Physics) CurrentWeaponAmmo() (current, max int) {
 	return p.Ammo[at], ammoCaps[at]
 }
 
+// HasWeapon returns true if the player owns weapon slot w.
+func (p *Physics) HasWeapon(w int) bool {
+	if w < 0 || w >= len(p.hasWeapon) {
+		return false
+	}
+	return p.hasWeapon[w]
+}
+
+// AmmoForSlot returns the current ammo count for the ammo type used by weapon slot w.
+// Returns 0 for the axe (no ammo) or out-of-range slots.
+func (p *Physics) AmmoForSlot(w int) int {
+	if w < 0 || w >= len(weaponAmmoReq) {
+		return 0
+	}
+	at := weaponAmmoReq[w][0]
+	if at == entities.AmmoNone || at >= len(p.Ammo) {
+		return 0
+	}
+	return p.Ammo[at]
+}
+
 // tickWeapon dispatches to the active weapon's tick and handles weapon switching.
 func tickWeapon(p *Physics, snap inputSnapshot, dt float32) {
 	// Weapon switching via keys 1–8.

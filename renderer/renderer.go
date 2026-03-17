@@ -18,13 +18,16 @@ import (
 // HUDAssets holds decoded LMP sprites for the in-game status bar.
 // All fields are optional; nil means that element won't be drawn.
 type HUDAssets struct {
-	SBar  *gfx.LMPImage    // status bar background (320×24)
-	Nums  [10]*gfx.LMPImage // big digit sprites 0–9
-	Faces [5]*gfx.LMPImage  // face sprites for health ranges (index 0 = high health)
+	SBar       *gfx.LMPImage    // status bar background (320×24)
+	Nums       [10]*gfx.LMPImage // big digit sprites 0–9
+	Faces      [5]*gfx.LMPImage  // face sprites for health ranges (index 0 = high health)
+	WeaponsDim [8]*gfx.LMPImage  // inv_  series: dim/unowned weapon icons
+	WeaponsLit [8]*gfx.LMPImage  // inv2_ series: lit/owned weapon icons
+	SmallNums  [10]*gfx.LMPImage // 8×8 ammo digit sprites
 }
 
-// hudSprite stores normalised atlas UV coordinates for one sprite.
-type hudSprite struct{ u0, v0, u1, v1 float32 }
+// hudSprite stores normalised atlas UV coordinates and pixel size for one sprite.
+type hudSprite struct{ u0, v0, u1, v1, pw, ph float32 }
 
 // hudGradFragSrc is the fallback gradient health-bar shader used when no HUD assets are available.
 const hudGradFragSrc = `#version 430 core
@@ -135,12 +138,18 @@ type Renderer struct {
 	hudAtlasTex uint32
 	hudVAO      uint32
 	hudVBO      uint32
-	hudSBar     hudSprite
-	hudNums     [10]hudSprite
-	hudFaces    [5]hudSprite
-	hudSBarW    float32 // pixel width of sbar sprite
-	hudSBarH    float32 // pixel height of sbar sprite
-	hudValid    bool    // true when atlas sprites are ready
+	hudSBar      hudSprite
+	hudNums      [10]hudSprite
+	hudFaces     [5]hudSprite
+	hudSBarW     float32 // pixel width of sbar sprite
+	hudSBarH     float32 // pixel height of sbar sprite
+	hudValid     bool    // true when atlas sprites are ready
+	hudWeapDim   [8]hudSprite
+	hudWeapLit   [8]hudSprite
+	hudSmallNums [10]hudSprite
+	hudGoldTexel hudSprite
+	hudWeapBarY  float32 // virtual y where weapon bar starts (= sbarH)
+	hudTotalH    float32 // total virtual height (sbarH + weapon bar height)
 
 	// underwater tint overlay
 	underwaterProg    uint32
@@ -443,12 +452,12 @@ func Init(m *bsp.Map,
 	}
 
 	// HUD — dynamic VBO (shared by both gradient and atlas paths).
-	// Capacity: 64 quads × 6 verts × 4 floats per vert × 4 bytes.
+	// Capacity: 128 quads × 6 verts × 4 floats per vert × 4 bytes.
 	gl.GenVertexArrays(1, &r.hudVAO)
 	gl.BindVertexArray(r.hudVAO)
 	gl.GenBuffers(1, &r.hudVBO)
 	gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
-	gl.BufferData(gl.ARRAY_BUFFER, 64*6*4*4, nil, gl.DYNAMIC_DRAW)
+	gl.BufferData(gl.ARRAY_BUFFER, 128*6*4*4, nil, gl.DYNAMIC_DRAW)
 	gl.EnableVertexAttribArray(0)
 	gl.VertexAttribPointerWithOffset(0, 2, gl.FLOAT, false, 16, 0)
 	gl.EnableVertexAttribArray(1)
@@ -1124,12 +1133,38 @@ func buildHUDAtlas(r *Renderer, a *HUDAssets) bool {
 		return false
 	}
 
-	// Layout: row0 = sbar, row1 = digits + faces.
+	// Measure weapon icon row height.
+	iconH := 0
+	for _, img := range a.WeaponsDim {
+		if img != nil && img.Height > iconH {
+			iconH = img.Height
+		}
+	}
+	for _, img := range a.WeaponsLit {
+		if img != nil && img.Height > iconH {
+			iconH = img.Height
+		}
+	}
+	if iconH == 0 {
+		iconH = 24 // fallback
+	}
+
+	// Layout:
+	//   row0: sbar (height = sbarH)
+	//   row1: big digits + faces (height = spriteH)
+	//   row2: dim weapon icons
+	//   row3: lit weapon icons
+	//   row4: gold texel (1px)
+	//   row5: small ammo digits (8px)
 	row1Y := sbarH
 	if row1Y > 0 {
 		row1Y++ // 1px padding
 	}
-	rawH := row1Y + spriteH + 1
+	row2Y := row1Y + spriteH + 1
+	row3Y := row2Y + iconH + 1
+	row4Y := row3Y + iconH + 1
+	row5Y := row4Y + 2
+	rawH := row5Y + 8 + 1
 	atlasH := 1
 	for atlasH < rawH {
 		atlasH <<= 1
@@ -1154,12 +1189,34 @@ func buildHUDAtlas(r *Renderer, a *HUDAssets) bool {
 		}
 	}
 
+	// blitDim copies img with alpha multiplied by factor (0.0–1.0).
+	blitDim := func(img *gfx.LMPImage, destX, destY int, factor float32) {
+		for py := 0; py < img.Height; py++ {
+			for px := 0; px < img.Width; px++ {
+				src := (py*img.Width + px) * 4
+				dst := ((destY+py)*atlasW + (destX + px)) * 4
+				if dst+3 < len(pixels) {
+					pixels[dst+0] = img.RGBA[src+0]
+					pixels[dst+1] = img.RGBA[src+1]
+					pixels[dst+2] = img.RGBA[src+2]
+					a := float32(img.RGBA[src+3]) * factor
+					if a > 255 {
+						a = 255
+					}
+					pixels[dst+3] = byte(a)
+				}
+			}
+		}
+	}
+
 	sprite := func(x, y, w, h int) hudSprite {
 		return hudSprite{
 			u0: float32(x) * invW,
 			v0: float32(y) * invH,
 			u1: float32(x+w) * invW,
 			v1: float32(y+h) * invH,
+			pw: float32(w),
+			ph: float32(h),
 		}
 	}
 
@@ -1191,6 +1248,56 @@ func buildHUDAtlas(r *Renderer, a *HUDAssets) bool {
 		r.hudFaces[i] = sprite(fx, row1Y, f.Width, f.Height)
 	}
 
+	// Row 2: dim weapon icons (40% alpha for unowned look).
+	const iconSlotW = 32
+	for i, img := range a.WeaponsDim {
+		if img == nil {
+			continue
+		}
+		ix := i * iconSlotW
+		blitDim(img, ix, row2Y, 0.4)
+		r.hudWeapDim[i] = sprite(ix, row2Y, img.Width, img.Height)
+	}
+
+	// Row 3: lit weapon icons (full alpha for owned look).
+	for i, img := range a.WeaponsLit {
+		if img == nil {
+			continue
+		}
+		ix := i * iconSlotW
+		blit(img, ix, row3Y)
+		r.hudWeapLit[i] = sprite(ix, row3Y, img.Width, img.Height)
+	}
+
+	// Row 4: gold selection texel at x=508.
+	{
+		const gx, gy = 508, 0
+		goldY := row4Y + gy
+		dst := (goldY*atlasW + gx) * 4
+		if dst+3 < len(pixels) {
+			pixels[dst+0] = 255
+			pixels[dst+1] = 210
+			pixels[dst+2] = 0
+			pixels[dst+3] = 255
+		}
+		r.hudGoldTexel = sprite(gx, row4Y, 1, 1)
+	}
+
+	// Row 5: small ammo digits (8×8).
+	for i, sn := range a.SmallNums {
+		if sn == nil {
+			continue
+		}
+		sx := i * 8
+		blit(sn, sx, row5Y)
+		r.hudSmallNums[i] = sprite(sx, row5Y, sn.Width, sn.Height)
+	}
+
+	// Store weapon bar layout parameters.
+	r.hudWeapBarY = r.hudSBarH
+	const weapBarH = float32(28)
+	r.hudTotalH = r.hudSBarH + weapBarH
+
 	// Upload atlas texture.
 	gl.GenTextures(1, &r.hudAtlasTex)
 	gl.BindTexture(gl.TEXTURE_2D, r.hudAtlasTex)
@@ -1209,13 +1316,17 @@ func buildHUDAtlas(r *Renderer, a *HUDAssets) bool {
 // Each quad is 6 vertices × 4 floats (x, y, u, v).
 // Returns the slice and the vertex count.
 func (r *Renderer) buildHUDVerts(p *physics.Physics) ([]float32, int) {
-	// HUD occupies bottom strip in NDC. Virtual HUD coords: 0..320 wide, 0..sbarH tall.
+	// HUD occupies bottom strip in NDC.
+	// Virtual HUD coords: 0..320 wide, 0..hudTotalH tall.
 	refW := float32(320)
-	refH := r.hudSBarH
+	refH := r.hudTotalH
+	if refH <= 0 {
+		refH = r.hudSBarH
+	}
 	if refH <= 0 {
 		refH = 24
 	}
-	const hudNDCHeight = float32(0.15) // fraction of [-1,1] y range the HUD occupies
+	const hudNDCHeight = float32(0.20) // fraction of [-1,1] y range the HUD occupies
 
 	ndcX := func(vx float32) float32 { return (vx/refW)*2.0 - 1.0 }
 	ndcY := func(vy float32) float32 { return -1.0 + (vy/refH)*hudNDCHeight }
@@ -1272,15 +1383,60 @@ func (r *Renderer) buildHUDVerts(p *physics.Physics) ([]float32, int) {
 		quad(112, 0, 136, 24, r.hudFaces[faceIdx])
 	}
 
-	// 4. Ammo digits at vx=248.
-	ammo, _ := p.CurrentWeaponAmmo()
-	if ammo < 0 {
-		ammo = 0
+	// 4. Weapon inventory bar (above the sbar).
+	if r.hudWeapBarY > 0 || r.hudTotalH > r.hudSBarH {
+		const slotW = float32(32)
+		const iconH = float32(24)
+		const barX0 = float32(32)
+		barY0 := r.hudWeapBarY
+		barY1 := barY0 + iconH
+
+		for slot := 0; slot < 8; slot++ {
+			slotX0 := barX0 + float32(slot)*slotW
+			slotX1 := slotX0 + slotW
+
+			// Gold border for active weapon slot.
+			if slot == p.Weapon && r.hudGoldTexel.u1 > r.hudGoldTexel.u0 {
+				quad(slotX0-2, barY0-2, slotX1+2, barY1+2, r.hudGoldTexel)
+			}
+
+			// Skip unowned slots entirely.
+			if !p.HasWeapon(slot) {
+				continue
+			}
+
+			// Icon quad (lit = owned).
+			sp := r.hudWeapLit[slot]
+			if sp.u1 > sp.u0 {
+				// Centre icon horizontally within the 32px slot.
+				iconOffset := (slotW - sp.pw) / 2
+				quad(slotX0+iconOffset, barY0, slotX0+iconOffset+sp.pw, barY1, sp)
+			}
+
+			// Ammo count (2 small digits) in bottom-right of each non-axe slot.
+			if slot > 0 {
+				slotAmmo := p.AmmoForSlot(slot)
+				if slotAmmo < 0 {
+					slotAmmo = 0
+				}
+				if slotAmmo > 99 {
+					slotAmmo = 99
+				}
+				d1 := slotAmmo / 10
+				d0 := slotAmmo % 10
+				const dw = float32(8)
+				const dh = float32(8)
+				digitX0 := slotX1 - dw*2
+				digitY0 := barY0
+				if r.hudSmallNums[d1].u1 > r.hudSmallNums[d1].u0 {
+					quad(digitX0, digitY0, digitX0+dw, digitY0+dh, r.hudSmallNums[d1])
+				}
+				if r.hudSmallNums[d0].u1 > r.hudSmallNums[d0].u0 {
+					quad(digitX0+dw, digitY0, digitX0+dw*2, digitY0+dh, r.hudSmallNums[d0])
+				}
+			}
+		}
 	}
-	if ammo > 999 {
-		ammo = 999
-	}
-	drawDigits(ammo, 248)
 
 	return verts, len(verts) / 4
 }

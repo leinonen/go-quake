@@ -1,6 +1,4 @@
-package vis
-
-import "go-quake/bsp"
+package bsp
 
 // DecompressPVS decompresses the RLE-encoded PVS for a leaf's visofs.
 // Returns a bitset where bit i = leaf i is visible.
@@ -57,7 +55,7 @@ func IsLeafVisible(pvs []byte, leafIdx int) bool {
 }
 
 // LeafForPoint finds which BSP leaf contains the given point.
-func LeafForPoint(m *bsp.Map, point [3]float32) int {
+func LeafForPoint(m *Map, point [3]float32) int {
 	if len(m.Nodes) == 0 {
 		return 0
 	}

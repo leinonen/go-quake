@@ -6,7 +6,6 @@ import (
 
 	"github.com/go-gl/gl/v4.3-core/gl"
 	"go-quake/bsp"
-	"go-quake/vis"
 )
 
 // LeafDescGPU mirrors the GLSL LeafDesc struct (std430).
@@ -111,7 +110,7 @@ func (cs *ComputeState) Dispatch(currentLeaf int) {
 		if currentLeaf >= 0 && currentLeaf < len(cs.m.Leaves) {
 			visofs = cs.m.Leaves[currentLeaf].VisOfs
 		}
-		pvs := vis.DecompressPVS(cs.m.VisData, visofs, len(cs.m.Leaves))
+		pvs := bsp.DecompressPVS(cs.m.VisData, visofs, len(cs.m.Leaves))
 		bitset := pvsToBitset(pvs, len(cs.m.Leaves))
 
 		gl.BindBuffer(gl.SHADER_STORAGE_BUFFER, cs.ssboPVSBitset)

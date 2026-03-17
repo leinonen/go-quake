@@ -18,9 +18,7 @@ import (
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
 	"go-quake/entities"
-	"go-quake/game"
 	"go-quake/gfx"
-	"go-quake/input"
 	"go-quake/mdl"
 	"go-quake/pak"
 	"go-quake/physics"
@@ -82,7 +80,7 @@ func main() {
 	var allWeaponModels [8]renderer.WeaponModel
 	var weaponFrameCounts [8]int
 	var itemModels []renderer.ItemModel
-	var itemStates []game.ItemState
+	var initItems []physics.ItemState
 	var itemSpawns []entities.ItemSpawn
 	var monsterStates []entities.MonsterState
 	var flameStates []entities.FlameState
@@ -190,7 +188,7 @@ func main() {
 				im := loadItemModel(p, sp.ModelPath, palette)
 				itemModels = append(itemModels, im)
 			}
-			itemStates = append(itemStates, game.ItemState{
+			initItems = append(initItems, physics.ItemState{
 				Pos:    sp.Pos,
 				MdlIdx: modelPathToIdx[sp.ModelPath],
 			})
@@ -203,7 +201,7 @@ func main() {
 				log.Printf("item classname not mapped: %s", class)
 			}
 		}
-		log.Printf("items: %d spawns, %d unique models", len(itemStates), len(itemModels))
+		log.Printf("items: %d spawns, %d unique models", len(initItems), len(itemModels))
 
 		// Load monster MDL models — all animation frames.
 		monsterSpawns := entities.ParseMonsters(m.Entities)
@@ -313,12 +311,7 @@ func main() {
 	mgr := entities.NewManager(m)
 	log.Printf("brush entities: %d (func_door/func_plat)", len(mgr.Entities))
 
-	bus := game.NewBus()
-	go physics.Run(m, mgr, bus, spawn, itemSpawns, monsterStates, flameStates, weaponFrameCounts)
-
-	playerState := game.PlayerState{Position: spawn, Health: 100}
-	pickedItems := make([]bool, len(itemSpawns))
-	numItems := len(itemSpawns)
+	phys := physics.New(win, m, mgr, spawn, itemSpawns, initItems, monsterStates, flameStates, weaponFrameCounts)
 
 	var screenshotRequested bool
 	win.SetKeyCallback(func(w *glfw.Window, key glfw.Key, _ int, action glfw.Action, _ glfw.ModifierKey) {
@@ -332,65 +325,24 @@ func main() {
 		}
 	})
 
-	// Watchdog: if the main loop stalls for >3s, dump all goroutine stacks.
-	watchdog := make(chan struct{}, 1)
-	go func() {
-		for {
-			select {
-			case <-watchdog:
-				// heartbeat received, keep watching
-			case <-time.After(3 * time.Second):
-				buf := make([]byte, 1<<20)
-				n := runtime.Stack(buf, true)
-				fmt.Fprintf(os.Stderr, "\n=== HANG DETECTED — goroutine dump ===\n%s\n", buf[:n])
-			}
-		}
-	}()
-
-	var lastTime = time.Now()
+	var prevTime = time.Now()
 	var debugTick uint
 
 	for !win.ShouldClose() {
-		select {
-		case watchdog <- struct{}{}:
-		default:
+		now := time.Now()
+		dt := float32(now.Sub(prevTime).Seconds())
+		prevTime = now
+		if dt > 0.1 {
+			dt = 0.1 // cap
 		}
+
 		glfw.PollEvents()
-		input.Pump(win, bus, &lastTime)
-
-		select {
-		case ps := <-bus.Physics:
-			playerState = ps
-		default:
-		}
-
-		// Drain item pickup events from physics.
-	drainPickups:
-		for {
-			select {
-			case idx := <-bus.ItemPickups:
-				if idx >= 0 && idx < numItems {
-					pickedItems[idx] = true
-				}
-			default:
-				break drainPickups
-			}
-		}
-
-		// Build visible item list (exclude picked items) + live monsters from physics.
-		visibleItems := itemStates[:0:0]
-		for i, is := range itemStates {
-			if pickedItems[i] {
-				continue
-			}
-			visibleItems = append(visibleItems, is)
-		}
-		visibleItems = append(visibleItems, playerState.MonsterItems...)
+		phys.Tick(dt)
 
 		w, h := win.GetFramebufferSize()
 		gl.Viewport(0, 0, int32(w), int32(h))
 
-		rend.Draw(game.RenderFrame{Player: playerState, Items: visibleItems}, w, h)
+		rend.Draw(phys, w, h)
 
 		if screenshotRequested {
 			screenshotRequested = false
@@ -399,16 +351,14 @@ func main() {
 
 		debugTick++
 		if debugTick%30 == 0 {
-			pos := [3]float32(playerState.Position)
+			pos := [3]float32(phys.Pos)
 			title := fmt.Sprintf("go-quake | HP: %d | leaf %d | pos: %.0f %.0f %.0f",
-				playerState.Health, playerState.LeafIndex, pos[0], pos[1], pos[2])
+				phys.Health, phys.LeafIndex, pos[0], pos[1], pos[2])
 			win.SetTitle(title)
 		}
 
 		win.SwapBuffers()
 	}
-
-	close(bus.Shutdown)
 
 	win.SetInputMode(glfw.CursorMode, glfw.CursorNormal)
 	glfw.PollEvents()
@@ -562,7 +512,7 @@ func loadMDLAllFrames(p pakReader, modelPath string, palette []byte) (renderer.I
 			TexH:   mmdl.SkinHeight,
 		}})
 	}
-	if len(frames) > 0 {
+	if len(frames) > 0 && frames[0] != nil {
 		log.Printf("monster MDL loaded: %s (%d frames, %d tris)", modelPath, nf, len(frames[0][0].Verts)/15)
 	}
 	return renderer.ItemModel{Frames: frames}, mmdl.FrameNames()

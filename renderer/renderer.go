@@ -11,8 +11,8 @@ import (
 	"github.com/go-gl/gl/v4.3-core/gl"
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
-	"go-quake/game"
 	"go-quake/gfx"
+	"go-quake/physics"
 )
 
 // HUDAssets holds decoded LMP sprites for the in-game status bar.
@@ -516,20 +516,20 @@ func Init(m *bsp.Map,
 	return r, nil
 }
 
-// Draw renders one frame given the player state.
-func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
+// Draw renders one frame given the physics state.
+func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 	gl.Clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
 	gl.ClearColor(0.1, 0.1, 0.15, 1.0)
 
 	if r.usePVS {
-		r.compute.Dispatch(frame.Player.LeafIndex)
+		r.compute.Dispatch(p.LeafIndex)
 	}
 
 	proj := mgl32.Perspective(mgl32.DegToRad(90), float32(width)/float32(height), 4, 16384)
 
-	pos := frame.Player.Position
-	yaw := mgl32.DegToRad(frame.Player.Yaw)
-	pitch := mgl32.DegToRad(frame.Player.Pitch)
+	pos := p.Pos
+	yaw := mgl32.DegToRad(p.Yaw)
+	pitch := mgl32.DegToRad(p.Pitch)
 
 	// Forward vector from yaw+pitch
 	forward := mgl32.Vec3{
@@ -567,9 +567,9 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.BindVertexArray(0)
 
 	// Draw brush entities (PVS off, per-entity offset)
-	if len(frame.Player.Entities) > 0 {
+	if len(p.Entities) > 0 {
 		gl.Uniform1i(r.usePVSLoc, 0)
-		for _, es := range frame.Player.Entities {
+		for _, es := range p.Entities {
 			idx := es.ModelIndex - 1
 			if idx < 0 || idx >= len(r.entityVAOs) {
 				continue
@@ -601,13 +601,13 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	gl.DepthFunc(gl.LESS)
 
 	// Draw world items and monsters — MDL/BSP models at their origins.
-	if r.weaponProg != 0 && len(frame.Items) > 0 {
+	if r.weaponProg != 0 && len(p.Items) > 0 {
 		gl.Disable(gl.CULL_FACE)
 		gl.UseProgram(r.weaponProg)
 		gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])
 		gl.Uniform1i(r.weapTexLoc, 0)
 		gl.ActiveTexture(gl.TEXTURE0)
-		for _, is := range frame.Items {
+		for _, is := range p.Items {
 			if is.MdlIdx < 0 || is.MdlIdx >= len(r.itemVAOs) {
 				continue
 			}
@@ -634,16 +634,16 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	}
 
 	// Draw blood particles — alpha blended, depth write off.
-	if r.particleProg != 0 && len(frame.Player.Particles) > 0 {
+	if r.particleProg != 0 && len(p.Particles) > 0 {
 		r.particleScratch = r.particleScratch[:0]
-		for _, p := range frame.Player.Particles {
+		for _, pt := range p.Particles {
 			stuck := float32(0)
-			if p.Stuck {
+			if pt.Stuck {
 				stuck = 1
 			}
-			r.particleScratch = append(r.particleScratch, p.Pos[0], p.Pos[1], p.Pos[2], p.Life, stuck)
+			r.particleScratch = append(r.particleScratch, pt.Pos[0], pt.Pos[1], pt.Pos[2], pt.Life, stuck)
 		}
-		n := int32(len(frame.Player.Particles))
+		n := int32(len(p.Particles))
 		gl.BindBuffer(gl.ARRAY_BUFFER, r.particleVBO)
 		gl.BufferSubData(gl.ARRAY_BUFFER, 0, int(n)*20, unsafe.Pointer(&r.particleScratch[0]))
 		gl.BindBuffer(gl.ARRAY_BUFFER, 0)
@@ -667,7 +667,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	// Draw view weapon on top of everything — clear depth so it is never
 	// occluded by world geometry.
 	if r.weaponProg != 0 && len(r.weapons) > 0 {
-		weaponSlot := frame.Player.CurrentWeapon
+		weaponSlot := p.Weapon
 		if weaponSlot < 0 || weaponSlot >= len(r.weapons) {
 			weaponSlot = 0
 		}
@@ -677,7 +677,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 			gl.Clear(gl.DEPTH_BUFFER_BIT)
 			gl.Disable(gl.CULL_FACE)
 
-			wfIdx := frame.Player.WeaponFrame
+			wfIdx := p.WeaponFrame
 			if wfIdx < 0 || wfIdx >= len(wr.frames) {
 				wfIdx = 0
 			}
@@ -707,7 +707,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 	}
 
 	// Draw underwater tint — after weapon so it tints both world and weapon, before HUD.
-	if r.underwaterProg != 0 && frame.Player.InWater {
+	if r.underwaterProg != 0 && p.InWater {
 		gl.Disable(gl.DEPTH_TEST)
 		gl.Disable(gl.CULL_FACE)
 		gl.Enable(gl.BLEND)
@@ -731,7 +731,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 
 		if r.hudValid && r.hudProg != 0 {
 			// Sprite atlas path.
-			verts, nverts := r.buildHUDVerts(frame)
+			verts, nverts := r.buildHUDVerts(p)
 			if nverts > 0 {
 				gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
 				gl.BufferSubData(gl.ARRAY_BUFFER, 0, nverts*16, unsafe.Pointer(&verts[0]))
@@ -747,7 +747,7 @@ func (r *Renderer) Draw(frame game.RenderFrame, width, height int) {
 			}
 		} else if r.hudGradProg != 0 {
 			// Gradient fallback path.
-			frac := float32(frame.Player.Health) / 100.0
+			frac := float32(p.Health) / 100.0
 			if frac < 0 {
 				frac = 0
 			} else if frac > 1 {
@@ -1182,7 +1182,7 @@ func buildHUDAtlas(r *Renderer, a *HUDAssets) bool {
 // buildHUDVerts builds a flat float32 slice of HUD quads for this frame.
 // Each quad is 6 vertices × 4 floats (x, y, u, v).
 // Returns the slice and the vertex count.
-func (r *Renderer) buildHUDVerts(frame game.RenderFrame) ([]float32, int) {
+func (r *Renderer) buildHUDVerts(p *physics.Physics) ([]float32, int) {
 	// HUD occupies bottom strip in NDC. Virtual HUD coords: 0..320 wide, 0..sbarH tall.
 	refW := float32(320)
 	refH := r.hudSBarH
@@ -1215,7 +1215,7 @@ func (r *Renderer) buildHUDVerts(frame game.RenderFrame) ([]float32, int) {
 	}
 
 	// 2. Health digits at vx=136 (three digits, right-justified).
-	health := frame.Player.Health
+	health := p.Health
 	if health < 0 {
 		health = 0
 	}
@@ -1248,9 +1248,9 @@ func (r *Renderer) buildHUDVerts(frame game.RenderFrame) ([]float32, int) {
 
 	// 4. Ammo digits at vx=248.
 	ammo := 0
-	cw := frame.Player.CurrentWeapon
-	if cw >= 0 && cw < len(frame.Player.WeaponAmmo) {
-		ammo = frame.Player.WeaponAmmo[cw]
+	cw := p.Weapon
+	if cw >= 0 && cw < len(p.Ammo) {
+		ammo = p.Ammo[cw]
 	}
 	if ammo < 0 {
 		ammo = 0

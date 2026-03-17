@@ -5,8 +5,13 @@ import (
 	"math"
 
 	"go-quake/bsp"
-	"go-quake/game"
 )
+
+// EntityState carries per-frame render/collision state for one brush entity.
+type EntityState struct {
+	ModelIndex int
+	Offset     [3]float32
+}
 
 // State is the door/platform animation state.
 type State int
@@ -170,10 +175,10 @@ func (mgr *Manager) Update(dt float32, m *bsp.Map, playerPos [3]float32) {
 }
 
 // States returns the current render state for all entities.
-func (mgr *Manager) States() []game.EntityState {
-	states := make([]game.EntityState, len(mgr.Entities))
+func (mgr *Manager) States() []EntityState {
+	states := make([]EntityState, len(mgr.Entities))
 	for i, e := range mgr.Entities {
-		states[i] = game.EntityState{
+		states[i] = EntityState{
 			ModelIndex: e.ModelIndex,
 			Offset:     e.Offset,
 		}

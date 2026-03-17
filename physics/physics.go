@@ -8,8 +8,6 @@ import (
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
 	"go-quake/entities"
-	"go-quake/game"
-	"go-quake/vis"
 )
 
 const (
@@ -33,7 +31,22 @@ const (
 	monsterHullOffset = 24   // hull 1 bottom extent below entity origin (Quake standing hull)
 )
 
-// particle is an internal blood particle, owned by the physics goroutine.
+// ItemState carries the world position, mesh index, animation frame, and facing yaw for one item or monster.
+type ItemState struct {
+	Pos    [3]float32
+	MdlIdx int
+	Frame  int
+	Yaw    float32 // facing angle in radians (world Z rotation); 0 = +X direction
+}
+
+// ParticleState carries the world position and lifetime for one blood particle.
+type ParticleState struct {
+	Pos   [3]float32
+	Life  float32 // normalised 0..1 remaining lifetime (for alpha fade)
+	Stuck bool
+}
+
+// particle is an internal blood particle.
 type particle struct {
 	Pos, Vel [3]float32
 	Life     float32
@@ -42,273 +55,312 @@ type particle struct {
 	Active   bool
 }
 
-// physicsState holds all mutable physics state between ticks.
-type physicsState struct {
-	player          game.PlayerState
-	playerHP        int
-	respawnPos      mgl32.Vec3
-	weaponFrame     int
-	weaponFrameTime float32
-	weaponSwinging  bool
-	hitFired        bool
-	weaponNumFrames int
-	// multi-weapon state
-	currentWeapon     int
-	hasWeapon         [8]bool
-	ammo              [8]int // index 1=shells, 2=nails, 3=rockets, 4=cells
+// inputSnapshot is a single-frame snapshot of keyboard and mouse state.
+type inputSnapshot struct {
+	Keys         [512]bool
+	MouseButtons [8]bool
+	DX, DY       float64
+}
+
+// Physics holds all mutable physics state and is queried each frame by the renderer.
+type Physics struct {
+	// Exported — read by renderer each frame
+	Pos        mgl32.Vec3
+	Velocity   mgl32.Vec3
+	Yaw, Pitch float32
+	LeafIndex  int
+	OnGround   bool
+	Health     int
+	WeaponFrame int
+	Weapon     int   // active weapon slot (0=axe, 1=shotgun, ...)
+	Ammo       [8]int
+	InWater    bool
+	Entities   []entities.EntityState
+	Particles  []ParticleState
+	Items      []ItemState // visible world items + live monsters + flames (combined)
+
+	// private weapon state
+	weaponFrameTime  float32
+	weaponSwinging   bool
+	hitFired         bool
+	weaponNumFrames  int
+	hasWeapon        [8]bool
 	weaponFrameCounts [8]int
-	fireCooldown      float32
-	mouseWasDown      bool
-	monsters          []entities.MonsterState
-	flames            []entities.FlameState
-	particles         [particleCount]particle
-	particleScratch   []game.ParticleState // pre-alloc, reused each tick
-	nextFreeHint      int                  // amortised free-slot cursor
+	fireCooldown     float32
+	mouseWasDown     bool
+
+	// private physics state
+	respawnPos mgl32.Vec3
+
+	// private entity data
+	monsters []entities.MonsterState
+	flames   []entities.FlameState
+
+	// private particle pool
+	particles       [particleCount]particle
+	particleScratch []ParticleState
+	nextFreeHint    int
+
+	// private item data
+	itemSpawns []entities.ItemSpawn
+	initItems  []ItemState
+	picked     []bool
+
+	// private BSP/entity refs
+	m   *bsp.Map
+	mgr *entities.Manager
+	win *glfw.Window
 }
 
 // ammo caps per type (indexed by entities.AmmoShells..AmmoCells)
 var ammoCaps = [8]int{0, 100, 200, 100, 100}
 
-// Run is the physics goroutine. It receives input events and emits player states.
-func Run(m *bsp.Map, mgr *entities.Manager, bus *game.Bus, spawn mgl32.Vec3,
-	items []entities.ItemSpawn, monsters []entities.MonsterState,
-	flames []entities.FlameState, weaponFrameCounts [8]int) {
+// New creates and initialises a Physics instance.
+// initItems is a slice parallel to itemSpawns, pre-filled with Pos+MdlIdx for rendering.
+func New(win *glfw.Window, m *bsp.Map, mgr *entities.Manager, spawn mgl32.Vec3,
+	itemSpawns []entities.ItemSpawn, initItems []ItemState,
+	monsters []entities.MonsterState, flames []entities.FlameState,
+	weaponFrameCounts [8]int) *Physics {
 
-	ps := &physicsState{
-		player: game.PlayerState{
-			Position: spawn,
-			Health:   100,
-		},
-		playerHP:          100,
+	p := &Physics{
+		Pos:               spawn,
+		Health:            100,
 		respawnPos:        spawn,
 		weaponNumFrames:   weaponFrameCounts[0], // axe
 		weaponFrameCounts: weaponFrameCounts,
-		currentWeapon:     0,
+		Weapon:            0,
 		monsters:          monsters,
 		flames:            flames,
+		itemSpawns:        itemSpawns,
+		initItems:         initItems,
+		picked:            make([]bool, len(itemSpawns)),
+		m:                 m,
+		mgr:               mgr,
+		win:               win,
 	}
-	ps.hasWeapon[0] = true // axe always owned
-	ps.particleScratch = make([]game.ParticleState, 0, particleCount)
-	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
-	ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
-
-	picked := make([]bool, len(items))
-
-	for {
-		select {
-		case <-bus.Shutdown:
-			return
-		case ev := <-bus.Input:
-			tick(m, mgr, ps, ev)
-
-			// Check item pickups against player foot origin.
-			origin := [3]float32{
-				ps.player.Position[0],
-				ps.player.Position[1],
-				ps.player.Position[2] - eyeHeight,
-			}
-			for i, item := range items {
-				if picked[i] {
-					continue
-				}
-				dx := origin[0] - item.Pos[0]
-				dy := origin[1] - item.Pos[1]
-				dz := origin[2] - item.Pos[2]
-				if dx*dx+dy*dy+dz*dz < pickupRadius*pickupRadius {
-					picked[i] = true
-					if item.HealthValue > 0 {
-						ps.playerHP += item.HealthValue
-						if ps.playerHP > 100 {
-							ps.playerHP = 100
-						}
-					}
-					if item.WeaponType != entities.WeaponNone {
-						ps.hasWeapon[item.WeaponType] = true
-						ps.currentWeapon = item.WeaponType
-						ps.weaponNumFrames = ps.weaponFrameCounts[item.WeaponType]
-						ps.weaponFrame = 0
-						ps.weaponSwinging = false
-						ps.fireCooldown = 0
-						ps.mouseWasDown = false
-						// Grant Quake-standard starting ammo for this weapon.
-						wt := item.WeaponType
-						grantType := [8]int{0, entities.AmmoShells, entities.AmmoShells, entities.AmmoNails, entities.AmmoNails, entities.AmmoRockets, entities.AmmoRockets, entities.AmmoCells}
-						grantAmt := [8]int{0, 25, 5, 30, 30, 5, 5, 15}
-						at, amt := grantType[wt], grantAmt[wt]
-						if at != entities.AmmoNone {
-							ps.ammo[at] += amt
-							if ps.ammo[at] > ammoCaps[at] {
-								ps.ammo[at] = ammoCaps[at]
-							}
-						}
-					}
-					if item.AmmoType != entities.AmmoNone && item.AmmoAmount > 0 {
-						ps.ammo[item.AmmoType] += item.AmmoAmount
-						if item.AmmoType < len(ammoCaps) && ps.ammo[item.AmmoType] > ammoCaps[item.AmmoType] {
-							ps.ammo[item.AmmoType] = ammoCaps[item.AmmoType]
-						}
-					}
-					select {
-					case bus.ItemPickups <- i:
-					default:
-					}
-				}
-			}
-
-			// Non-blocking send to coordinator
-			select {
-			case bus.Physics <- ps.player:
-			default:
-				// Drain stale and replace
-				select {
-				case <-bus.Physics:
-				default:
-				}
-				bus.Physics <- ps.player
-			}
-		}
-	}
+	p.hasWeapon[0] = true // axe always owned
+	p.particleScratch = make([]ParticleState, 0, particleCount)
+	p.LeafIndex = bsp.LeafForPoint(m, [3]float32(p.Pos))
+	p.InWater = p.LeafIndex < len(m.Leaves) && m.Leaves[p.LeafIndex].Contents == bsp.ContentsWater
+	return p
 }
 
-func tick(m *bsp.Map, mgr *entities.Manager, ps *physicsState, ev game.InputEvent) {
+// Tick advances physics by dt seconds. Must be called from the GL/main thread.
+func (p *Physics) Tick(dt float32) {
+	snap := p.readInput()
+
 	// Mouse look
-	ps.player.Yaw -= float32(ev.MouseDX * mouseSens)
-	ps.player.Pitch -= float32(ev.MouseDY * mouseSens)
-	if ps.player.Pitch > 89 {
-		ps.player.Pitch = 89
+	p.Yaw -= float32(snap.DX * mouseSens)
+	p.Pitch -= float32(snap.DY * mouseSens)
+	if p.Pitch > 89 {
+		p.Pitch = 89
 	}
-	if ps.player.Pitch < -89 {
-		ps.player.Pitch = -89
+	if p.Pitch < -89 {
+		p.Pitch = -89
 	}
 
-	dt := float32(ev.Dt)
 	if dt <= 0 {
+		p.buildItems()
 		return
 	}
 
 	// No clip nodes → noclip fallback
-	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
-		noclip(m, ps, ev, dt)
+	if len(p.m.ClipNodes) == 0 || len(p.m.Models) == 0 {
+		noclip(p, snap, dt)
 		return
 	}
 
-	hull := m.Models[0].HeadNodes[1] // standing player hull
+	hull := p.m.Models[0].HeadNodes[1] // standing player hull
 
 	// Player origin = eye position minus view height
-	origin := [3]float32{ps.player.Position[0], ps.player.Position[1], ps.player.Position[2] - eyeHeight}
+	origin := [3]float32{p.Pos[0], p.Pos[1], p.Pos[2] - eyeHeight}
 
 	// Advance entity state machines before movement
-	mgr.Update(dt, m, origin)
+	p.mgr.Update(dt, p.m, origin)
 
-	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
+	yaw := float64(mgl32.DegToRad(p.Yaw))
 	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
 	right := [3]float32{float32(math.Sin(yaw)), float32(-math.Cos(yaw)), 0}
 
 	// Desired horizontal velocity from WASD
 	var wishX, wishY float32
 	spd := float32(moveSpeed)
-	if ev.Keys[glfw.KeyW] || ev.Keys[glfw.KeyUp] {
+	if snap.Keys[glfw.KeyW] || snap.Keys[glfw.KeyUp] {
 		wishX += fwd[0] * spd
 		wishY += fwd[1] * spd
 	}
-	if ev.Keys[glfw.KeyS] || ev.Keys[glfw.KeyDown] {
+	if snap.Keys[glfw.KeyS] || snap.Keys[glfw.KeyDown] {
 		wishX -= fwd[0] * spd
 		wishY -= fwd[1] * spd
 	}
-	if ev.Keys[glfw.KeyA] {
+	if snap.Keys[glfw.KeyA] {
 		wishX -= right[0] * spd
 		wishY -= right[1] * spd
 	}
-	if ev.Keys[glfw.KeyD] {
+	if snap.Keys[glfw.KeyD] {
 		wishX += right[0] * spd
 		wishY += right[1] * spd
 	}
 	// Override horizontal velocity — no momentum in Quake walking
-	ps.player.Velocity[0] = wishX
-	ps.player.Velocity[1] = wishY
+	p.Velocity[0] = wishX
+	p.Velocity[1] = wishY
 
 	// Apply gravity when airborne
-	if !ps.player.OnGround {
-		ps.player.Velocity[2] -= gravity * dt
+	if !p.OnGround {
+		p.Velocity[2] -= gravity * dt
 	}
 
 	// Jump
-	if ev.Keys[glfw.KeySpace] && ps.player.OnGround {
-		ps.player.Velocity[2] = jumpSpeed
-		ps.player.OnGround = false
+	if snap.Keys[glfw.KeySpace] && p.OnGround {
+		p.Velocity[2] = jumpSpeed
+		p.OnGround = false
 	}
 
 	// Slide move
-	disp := [3]float32{ps.player.Velocity[0] * dt, ps.player.Velocity[1] * dt, ps.player.Velocity[2] * dt}
-	newOrigin := slideMove(m, mgr.Entities, hull, origin, disp)
+	disp := [3]float32{p.Velocity[0] * dt, p.Velocity[1] * dt, p.Velocity[2] * dt}
+	newOrigin := slideMove(p.m, p.mgr.Entities, hull, origin, disp)
 
 	// Ground check: trace 2 units down from new position
 	groundEnd := [3]float32{newOrigin[0], newOrigin[1], newOrigin[2] - 2}
-	gtr := traceAll(m, mgr.Entities, hull, newOrigin, groundEnd)
+	gtr := traceAll(p.m, p.mgr.Entities, hull, newOrigin, groundEnd)
 	if gtr.Hit && gtr.Normal[2] > 0.7 {
-		ps.player.OnGround = true
-		ps.player.Velocity[2] = 0
+		p.OnGround = true
+		p.Velocity[2] = 0
 		newOrigin = gtr.EndPos
 	} else {
-		ps.player.OnGround = false
+		p.OnGround = false
 	}
 
-	ps.player.Position = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
-	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
-	ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
-	ps.player.Entities = mgr.States()
+	p.Pos = mgl32.Vec3{newOrigin[0], newOrigin[1], newOrigin[2] + eyeHeight}
+	p.LeafIndex = bsp.LeafForPoint(p.m, [3]float32(p.Pos))
+	p.InWater = p.LeafIndex < len(p.m.Leaves) && p.m.Leaves[p.LeafIndex].Contents == bsp.ContentsWater
+	p.Entities = p.mgr.States()
 
 	// Weapon tick
-	tickWeapon(ps, ev, dt)
+	tickWeapon(p, snap, dt)
 
 	// Monster tick (pass brush entities for door collision)
-	tickMonsters(m, mgr.Entities, ps, dt)
+	tickMonsters(p, dt)
 
 	// Particle tick
-	tickParticles(m, ps, dt)
-	tickFlames(ps, dt)
+	tickParticles(p, dt)
+	tickFlames(p, dt)
 
-	// Respawn on death
-	if ps.playerHP <= 0 {
-		ps.player.Position = ps.respawnPos
-		ps.player.Velocity = mgl32.Vec3{}
-		ps.player.OnGround = false
-		ps.playerHP = 100
-		ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
-		ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
-		for i := range ps.monsters {
-			ps.monsters[i].Alerted = false
+	// Check item pickups against player foot origin.
+	foot := [3]float32{p.Pos[0], p.Pos[1], p.Pos[2] - eyeHeight}
+	for i, item := range p.itemSpawns {
+		if p.picked[i] {
+			continue
+		}
+		dx := foot[0] - item.Pos[0]
+		dy := foot[1] - item.Pos[1]
+		dz := foot[2] - item.Pos[2]
+		if dx*dx+dy*dy+dz*dz < pickupRadius*pickupRadius {
+			p.picked[i] = true
+			if item.HealthValue > 0 {
+				p.Health += item.HealthValue
+				if p.Health > 100 {
+					p.Health = 100
+				}
+			}
+			if item.WeaponType != entities.WeaponNone {
+				p.hasWeapon[item.WeaponType] = true
+				p.Weapon = item.WeaponType
+				p.weaponNumFrames = p.weaponFrameCounts[item.WeaponType]
+				p.WeaponFrame = 0
+				p.weaponSwinging = false
+				p.fireCooldown = 0
+				p.mouseWasDown = false
+				wt := item.WeaponType
+				grantType := [8]int{0, entities.AmmoShells, entities.AmmoShells, entities.AmmoNails, entities.AmmoNails, entities.AmmoRockets, entities.AmmoRockets, entities.AmmoCells}
+				grantAmt := [8]int{0, 25, 5, 30, 30, 5, 5, 15}
+				at, amt := grantType[wt], grantAmt[wt]
+				if at != entities.AmmoNone {
+					p.Ammo[at] += amt
+					if p.Ammo[at] > ammoCaps[at] {
+						p.Ammo[at] = ammoCaps[at]
+					}
+				}
+			}
+			if item.AmmoType != entities.AmmoNone && item.AmmoAmount > 0 {
+				p.Ammo[item.AmmoType] += item.AmmoAmount
+				if item.AmmoType < len(ammoCaps) && p.Ammo[item.AmmoType] > ammoCaps[item.AmmoType] {
+					p.Ammo[item.AmmoType] = ammoCaps[item.AmmoType]
+				}
+			}
 		}
 	}
 
-	// Publish game state to player state
-	ps.player.Health = ps.playerHP
-	ps.player.WeaponFrame = ps.weaponFrame
-	ps.player.CurrentWeapon = ps.currentWeapon
-	ps.player.WeaponAmmo = ps.ammo
+	// Respawn on death
+	if p.Health <= 0 {
+		p.Pos = p.respawnPos
+		p.Velocity = mgl32.Vec3{}
+		p.OnGround = false
+		p.Health = 100
+		p.LeafIndex = bsp.LeafForPoint(p.m, [3]float32(p.Pos))
+		p.InWater = p.LeafIndex < len(p.m.Leaves) && p.m.Leaves[p.LeafIndex].Contents == bsp.ContentsWater
+		for i := range p.monsters {
+			p.monsters[i].Alerted = false
+		}
+	}
 
-	// Build MonsterItems from live monsters
-	ps.player.MonsterItems = ps.player.MonsterItems[:0]
-	for _, mn := range ps.monsters {
+	buildParticleItems(p)
+	p.buildItems()
+}
+
+// buildItems builds p.Items from unpicked world items + live monsters + flames.
+func (p *Physics) buildItems() {
+	p.Items = p.Items[:0]
+	for i, it := range p.initItems {
+		if !p.picked[i] {
+			p.Items = append(p.Items, it)
+		}
+	}
+	for _, mn := range p.monsters {
 		if mn.Dead {
 			continue
 		}
-		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
+		p.Items = append(p.Items, ItemState{
 			Pos:    mn.Pos,
 			MdlIdx: mn.MdlIdx,
 			Frame:  mn.FrameIdx,
 			Yaw:    mn.Yaw,
 		})
 	}
-	for _, f := range ps.flames {
-		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
+	for _, f := range p.flames {
+		p.Items = append(p.Items, ItemState{
 			Pos:    f.Pos,
 			MdlIdx: f.MdlIdx,
 			Frame:  f.FrameIdx,
 		})
 	}
+}
 
-	buildParticleItems(ps)
+// readInput polls the GLFW window for current key/mouse state.
+// Resets cursor to window centre and returns the delta.
+func (p *Physics) readInput() inputSnapshot {
+	var snap inputSnapshot
+	for _, k := range []glfw.Key{
+		glfw.KeyW, glfw.KeyA, glfw.KeyS, glfw.KeyD,
+		glfw.KeyUp, glfw.KeyDown,
+		glfw.KeySpace, glfw.KeyLeftControl, glfw.KeyC,
+		glfw.Key1, glfw.Key2, glfw.Key3, glfw.Key4,
+		glfw.Key5, glfw.Key6, glfw.Key7, glfw.Key8,
+	} {
+		if int(k) < 512 {
+			snap.Keys[k] = p.win.GetKey(k) == glfw.Press
+		}
+	}
+	mx, my := p.win.GetCursorPos()
+	ww, wh := p.win.GetSize()
+	cx, cy := float64(ww)/2, float64(wh)/2
+	p.win.SetCursorPos(cx, cy)
+	snap.DX = mx - cx
+	snap.DY = my - cy
+	for i := 0; i < 8; i++ {
+		snap.MouseButtons[i] = p.win.GetMouseButton(glfw.MouseButton(i)) == glfw.Press
+	}
+	return snap
 }
 
 // weaponAmmoReq is the {ammoType, minCost} needed to fire each weapon slot.
@@ -324,212 +376,212 @@ var weaponAmmoReq = [8][2]int{
 }
 
 // canFire reports whether the player has enough ammo to fire weapon slot w.
-func canFire(ps *physicsState, w int) bool {
+func canFire(p *Physics, w int) bool {
 	at, cost := weaponAmmoReq[w][0], weaponAmmoReq[w][1]
-	return at == entities.AmmoNone || ps.ammo[at] >= cost
+	return at == entities.AmmoNone || p.Ammo[at] >= cost
 }
 
 // autoSwitchWeapon switches to the best owned weapon below the current one that can fire.
-func autoSwitchWeapon(ps *physicsState) {
-	for slot := ps.currentWeapon - 1; slot >= 0; slot-- {
-		if ps.hasWeapon[slot] && canFire(ps, slot) {
-			ps.currentWeapon = slot
-			ps.weaponNumFrames = ps.weaponFrameCounts[slot]
-			ps.weaponFrame = 0
-			ps.weaponSwinging = false
-			ps.fireCooldown = 0
-			ps.mouseWasDown = false
+func autoSwitchWeapon(p *Physics) {
+	for slot := p.Weapon - 1; slot >= 0; slot-- {
+		if p.hasWeapon[slot] && canFire(p, slot) {
+			p.Weapon = slot
+			p.weaponNumFrames = p.weaponFrameCounts[slot]
+			p.WeaponFrame = 0
+			p.weaponSwinging = false
+			p.fireCooldown = 0
+			p.mouseWasDown = false
 			return
 		}
 	}
 }
 
 // tickWeapon dispatches to the active weapon's tick and handles weapon switching.
-func tickWeapon(ps *physicsState, ev game.InputEvent, dt float32) {
+func tickWeapon(p *Physics, snap inputSnapshot, dt float32) {
 	// Weapon switching via keys 1–8.
 	for slot := 0; slot < 8; slot++ {
 		k := glfw.Key(int(glfw.Key1) + slot)
-		if int(k) < 512 && ev.Keys[k] && ps.hasWeapon[slot] && slot != ps.currentWeapon {
-			ps.currentWeapon = slot
-			ps.weaponNumFrames = ps.weaponFrameCounts[slot]
-			ps.weaponFrame = 0
-			ps.weaponSwinging = false
-			ps.fireCooldown = 0
-			ps.mouseWasDown = false
+		if int(k) < 512 && snap.Keys[k] && p.hasWeapon[slot] && slot != p.Weapon {
+			p.Weapon = slot
+			p.weaponNumFrames = p.weaponFrameCounts[slot]
+			p.WeaponFrame = 0
+			p.weaponSwinging = false
+			p.fireCooldown = 0
+			p.mouseWasDown = false
 		}
 	}
 
-	switch ps.currentWeapon {
+	switch p.Weapon {
 	case 0:
-		tickAxe(ps, ev, dt)
+		tickAxe(p, snap, dt)
 	case 1, 2:
-		tickShotgun(ps, ev, dt)
+		tickShotgun(p, snap, dt)
 	case 3, 4:
-		tickNailgun(ps, ev, dt)
+		tickNailgun(p, snap, dt)
 	case 5, 6:
-		tickRocket(ps, ev, dt)
+		tickRocket(p, snap, dt)
 	case 7:
-		tickLightning(ps, ev, dt)
+		tickLightning(p, snap, dt)
 	}
 
 	// Auto-switch to lower-tier weapon when current weapon is out of ammo.
-	if ps.currentWeapon > 0 && !canFire(ps, ps.currentWeapon) {
-		autoSwitchWeapon(ps)
+	if p.Weapon > 0 && !canFire(p, p.Weapon) {
+		autoSwitchWeapon(p)
 	}
 }
 
 // tickAxe advances the axe swing animation and fires melee hit detection.
-func tickAxe(ps *physicsState, ev game.InputEvent, dt float32) {
-	if ps.weaponNumFrames <= 0 {
+func tickAxe(p *Physics, snap inputSnapshot, dt float32) {
+	if p.weaponNumFrames <= 0 {
 		return
 	}
 
 	// Start a swing on left-click when not already swinging.
-	if ev.MouseButtons[0] && !ps.weaponSwinging {
-		ps.weaponSwinging = true
-		ps.weaponFrame = 1
-		ps.weaponFrameTime = 0
-		ps.hitFired = false
+	if snap.MouseButtons[0] && !p.weaponSwinging {
+		p.weaponSwinging = true
+		p.WeaponFrame = 1
+		p.weaponFrameTime = 0
+		p.hitFired = false
 	}
 
-	if !ps.weaponSwinging {
+	if !p.weaponSwinging {
 		return
 	}
 
-	ps.weaponFrameTime += dt * weaponFPS
-	for ps.weaponFrameTime >= 1.0 {
-		ps.weaponFrameTime -= 1.0
-		ps.weaponFrame++
+	p.weaponFrameTime += dt * weaponFPS
+	for p.weaponFrameTime >= 1.0 {
+		p.weaponFrameTime -= 1.0
+		p.WeaponFrame++
 
 		// Fire hit check.
-		if !ps.hitFired && ps.weaponFrame >= weaponHitFrame {
-			ps.hitFired = true
-			tryAxeHit(ps)
+		if !p.hitFired && p.WeaponFrame >= weaponHitFrame {
+			p.hitFired = true
+			tryAxeHit(p)
 		}
 
 		// Swing completion.
-		if ps.weaponFrame >= ps.weaponNumFrames {
-			ps.weaponFrame = 0
-			ps.weaponSwinging = false
-			ps.hitFired = false
+		if p.WeaponFrame >= p.weaponNumFrames {
+			p.WeaponFrame = 0
+			p.weaponSwinging = false
+			p.hitFired = false
 			break
 		}
 	}
 }
 
 // tickShotgun handles semi-auto shotgun / super shotgun fire.
-func tickShotgun(ps *physicsState, ev game.InputEvent, dt float32) {
-	advanceRangedAnim(ps, dt, false)
-	mouseDown := ev.MouseButtons[0]
-	if mouseDown && !ps.mouseWasDown {
+func tickShotgun(p *Physics, snap inputSnapshot, dt float32) {
+	advanceRangedAnim(p, dt, false)
+	mouseDown := snap.MouseButtons[0]
+	if mouseDown && !p.mouseWasDown {
 		cost := 1
 		pellets := 6
 		spread := float32(0.06)
-		if ps.currentWeapon == entities.WeaponSuperShotgun {
+		if p.Weapon == entities.WeaponSuperShotgun {
 			cost = 2
 			pellets = 14
 			spread = 0.12
 		}
-		if ps.ammo[entities.AmmoShells] >= cost {
-			ps.ammo[entities.AmmoShells] -= cost
-			fireHitscan(ps, pellets, spread, 4)
-			startRangedAnim(ps)
+		if p.Ammo[entities.AmmoShells] >= cost {
+			p.Ammo[entities.AmmoShells] -= cost
+			fireHitscan(p, pellets, spread, 4)
+			startRangedAnim(p)
 		}
 	}
-	ps.mouseWasDown = mouseDown
+	p.mouseWasDown = mouseDown
 }
 
 // tickNailgun handles full-auto nailgun / super nailgun fire.
-func tickNailgun(ps *physicsState, ev game.InputEvent, dt float32) {
-	advanceRangedAnim(ps, dt, true)
-	if !ev.MouseButtons[0] {
-		ps.fireCooldown = 0
-		ps.weaponSwinging = false
-		ps.weaponFrame = 0
+func tickNailgun(p *Physics, snap inputSnapshot, dt float32) {
+	advanceRangedAnim(p, dt, true)
+	if !snap.MouseButtons[0] {
+		p.fireCooldown = 0
+		p.weaponSwinging = false
+		p.WeaponFrame = 0
 		return
 	}
-	ps.fireCooldown -= dt
-	if ps.fireCooldown > 0 {
+	p.fireCooldown -= dt
+	if p.fireCooldown > 0 {
 		return
 	}
 	cost := 1
 	damage := 9
-	if ps.currentWeapon == entities.WeaponSuperNailgun {
+	if p.Weapon == entities.WeaponSuperNailgun {
 		cost = 2
 		damage = 18
 	}
-	if ps.ammo[entities.AmmoNails] >= cost {
-		ps.ammo[entities.AmmoNails] -= cost
-		fireHitscan(ps, 1, 0, damage)
-		ps.fireCooldown = 0.1
-		startRangedAnim(ps)
+	if p.Ammo[entities.AmmoNails] >= cost {
+		p.Ammo[entities.AmmoNails] -= cost
+		fireHitscan(p, 1, 0, damage)
+		p.fireCooldown = 0.1
+		startRangedAnim(p)
 	}
 }
 
 // tickRocket handles semi-auto grenade / rocket launcher fire.
-func tickRocket(ps *physicsState, ev game.InputEvent, dt float32) { //nolint
-	advanceRangedAnim(ps, dt, false)
-	mouseDown := ev.MouseButtons[0]
-	if mouseDown && !ps.mouseWasDown {
+func tickRocket(p *Physics, snap inputSnapshot, dt float32) { //nolint
+	advanceRangedAnim(p, dt, false)
+	mouseDown := snap.MouseButtons[0]
+	if mouseDown && !p.mouseWasDown {
 		damage := 100
-		if ps.currentWeapon == entities.WeaponRocketLauncher {
+		if p.Weapon == entities.WeaponRocketLauncher {
 			damage = 120
 		}
-		if ps.ammo[entities.AmmoRockets] > 0 {
-			ps.ammo[entities.AmmoRockets]--
-			fireHitscan(ps, 1, 0, damage)
-			startRangedAnim(ps)
+		if p.Ammo[entities.AmmoRockets] > 0 {
+			p.Ammo[entities.AmmoRockets]--
+			fireHitscan(p, 1, 0, damage)
+			startRangedAnim(p)
 		}
 	}
-	ps.mouseWasDown = mouseDown
+	p.mouseWasDown = mouseDown
 }
 
 // tickLightning handles full-auto lightning gun fire.
-func tickLightning(ps *physicsState, ev game.InputEvent, dt float32) {
-	advanceRangedAnim(ps, dt, true)
-	if !ev.MouseButtons[0] {
-		ps.fireCooldown = 0
-		ps.weaponSwinging = false
-		ps.weaponFrame = 0
+func tickLightning(p *Physics, snap inputSnapshot, dt float32) {
+	advanceRangedAnim(p, dt, true)
+	if !snap.MouseButtons[0] {
+		p.fireCooldown = 0
+		p.weaponSwinging = false
+		p.WeaponFrame = 0
 		return
 	}
-	ps.fireCooldown -= dt
-	if ps.fireCooldown > 0 {
+	p.fireCooldown -= dt
+	if p.fireCooldown > 0 {
 		return
 	}
-	if ps.ammo[entities.AmmoCells] > 0 {
-		ps.ammo[entities.AmmoCells]--
-		fireHitscan(ps, 1, 0, 30)
-		ps.fireCooldown = 0.05
-		startRangedAnim(ps)
+	if p.Ammo[entities.AmmoCells] > 0 {
+		p.Ammo[entities.AmmoCells]--
+		fireHitscan(p, 1, 0, 30)
+		p.fireCooldown = 0.05
+		startRangedAnim(p)
 	}
 }
 
 // startRangedAnim begins the fire animation if not already playing.
-func startRangedAnim(ps *physicsState) {
-	if !ps.weaponSwinging && ps.weaponNumFrames > 1 {
-		ps.weaponSwinging = true
-		ps.weaponFrame = 1
-		ps.weaponFrameTime = 0
+func startRangedAnim(p *Physics) {
+	if !p.weaponSwinging && p.weaponNumFrames > 1 {
+		p.weaponSwinging = true
+		p.WeaponFrame = 1
+		p.weaponFrameTime = 0
 	}
 }
 
-// advanceRangedAnim advances weaponFrame for ranged weapons.
+// advanceRangedAnim advances WeaponFrame for ranged weapons.
 // loop=true: loops animation while weaponSwinging; loop=false: plays once then stops.
-func advanceRangedAnim(ps *physicsState, dt float32, loop bool) {
-	if !ps.weaponSwinging || ps.weaponNumFrames <= 1 {
+func advanceRangedAnim(p *Physics, dt float32, loop bool) {
+	if !p.weaponSwinging || p.weaponNumFrames <= 1 {
 		return
 	}
-	ps.weaponFrameTime += dt * weaponFPS
-	for ps.weaponFrameTime >= 1.0 {
-		ps.weaponFrameTime -= 1.0
-		ps.weaponFrame++
-		if ps.weaponFrame >= ps.weaponNumFrames {
+	p.weaponFrameTime += dt * weaponFPS
+	for p.weaponFrameTime >= 1.0 {
+		p.weaponFrameTime -= 1.0
+		p.WeaponFrame++
+		if p.WeaponFrame >= p.weaponNumFrames {
 			if loop {
-				ps.weaponFrame = 1
+				p.WeaponFrame = 1
 			} else {
-				ps.weaponFrame = 0
-				ps.weaponSwinging = false
+				p.WeaponFrame = 0
+				p.weaponSwinging = false
 				break
 			}
 		}
@@ -538,10 +590,10 @@ func advanceRangedAnim(ps *physicsState, dt float32, loop bool) {
 
 // fireHitscan fires numPellets rays from the player eye with optional spread.
 // Each pellet tests all live monsters using a ray-vs-sphere closest-point check.
-func fireHitscan(ps *physicsState, numPellets int, spreadFactor float32, damage int) {
-	eyePos := [3]float32(ps.player.Position)
-	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
-	pitch := float64(mgl32.DegToRad(ps.player.Pitch))
+func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
+	eyePos := [3]float32(p.Pos)
+	yaw := float64(mgl32.DegToRad(p.Yaw))
+	pitch := float64(mgl32.DegToRad(p.Pitch))
 	baseFwdX := float32(math.Cos(pitch) * math.Cos(yaw))
 	baseFwdY := float32(math.Cos(pitch) * math.Sin(yaw))
 	baseFwdZ := float32(math.Sin(pitch))
@@ -549,7 +601,7 @@ func fireHitscan(ps *physicsState, numPellets int, spreadFactor float32, damage 
 	const rayLen = 2048.0
 	const hitRadius = 40.0
 
-	for p := 0; p < numPellets; p++ {
+	for pellet := 0; pellet < numPellets; pellet++ {
 		dx, dy, dz := baseFwdX, baseFwdY, baseFwdZ
 		if spreadFactor > 0 && numPellets > 1 {
 			dx += (rand.Float32()*2 - 1) * spreadFactor
@@ -564,8 +616,8 @@ func fireHitscan(ps *physicsState, numPellets int, spreadFactor float32, damage 
 			dz /= mag
 		}
 
-		for i := range ps.monsters {
-			mn := &ps.monsters[i]
+		for i := range p.monsters {
+			mn := &p.monsters[i]
 			if mn.Dead {
 				continue
 			}
@@ -587,17 +639,17 @@ func fireHitscan(ps *physicsState, numPellets int, spreadFactor float32, damage 
 				if mn.HP < 0 {
 					mn.HP = 0
 				}
-				emitBloodParticles(ps, mn.Pos, dx, dy, dz)
+				emitBloodParticles(p, mn.Pos, dx, dy, dz)
 			}
 		}
 	}
 }
 
 // tryAxeHit casts a 64-unit ray from eye and sphere-tests against live monsters.
-func tryAxeHit(ps *physicsState) {
-	eyePos := [3]float32(ps.player.Position)
-	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
-	pitch := float64(mgl32.DegToRad(ps.player.Pitch))
+func tryAxeHit(p *Physics) {
+	eyePos := [3]float32(p.Pos)
+	yaw := float64(mgl32.DegToRad(p.Yaw))
+	pitch := float64(mgl32.DegToRad(p.Pitch))
 	fwdX := float32(math.Cos(pitch) * math.Cos(yaw))
 	fwdY := float32(math.Cos(pitch) * math.Sin(yaw))
 	fwdZ := float32(math.Sin(pitch))
@@ -608,8 +660,8 @@ func tryAxeHit(ps *physicsState) {
 	tipY := eyePos[1] + fwdY*rayLen
 	tipZ := eyePos[2] + fwdZ*rayLen
 
-	for i := range ps.monsters {
-		mn := &ps.monsters[i]
+	for i := range p.monsters {
+		mn := &p.monsters[i]
 		if mn.Dead {
 			continue
 		}
@@ -621,26 +673,26 @@ func tryAxeHit(ps *physicsState) {
 			if mn.HP < 0 {
 				mn.HP = 0
 			}
-			emitBloodParticles(ps, mn.Pos, fwdX, fwdY, fwdZ)
+			emitBloodParticles(p, mn.Pos, fwdX, fwdY, fwdZ)
 		}
 	}
 }
 
 // tickMonsters advances monster AI, animation, gravity and collision for one tick.
-func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsState, dt float32) {
-	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
+func tickMonsters(p *Physics, dt float32) {
+	if len(p.m.ClipNodes) == 0 || len(p.m.Models) == 0 {
 		return
 	}
 
 	playerFoot := [3]float32{
-		ps.player.Position[0],
-		ps.player.Position[1],
-		ps.player.Position[2] - eyeHeight,
+		p.Pos[0],
+		p.Pos[1],
+		p.Pos[2] - eyeHeight,
 	}
-	pointHull := m.Models[0].HeadNodes[0]
+	pointHull := p.m.Models[0].HeadNodes[0]
 
-	for i := range ps.monsters {
-		mn := &ps.monsters[i]
+	for i := range p.monsters {
+		mn := &p.monsters[i]
 
 		// Transition to death animation when HP first hits zero.
 		if mn.HP <= 0 && mn.AnimState != entities.AnimDead && !mn.Dead {
@@ -720,7 +772,7 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 
 		// Alert check: LOS trace from monster to player (world only)
 		if !mn.Alerted && dist < 1024 {
-			tr := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, mn.Pos, playerFoot)
+			tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, mn.Pos, playerFoot)
 			if !tr.Hit {
 				mn.Alerted = true
 			}
@@ -735,16 +787,16 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 				mn.Pos[1] + dy/dist*spd,
 				mn.Pos[2],
 			}
-			tr := monsterMoveTrace(m, brushEnts, mn.Pos, moveEnd)
+			tr := monsterMoveTrace(p.m, p.mgr.Entities, mn.Pos, moveEnd)
 			// Monster-to-monster separation: reject XY move if it would overlap another monster.
 			newX, newY := tr.EndPos[0], tr.EndPos[1]
 			overlap := false
-			for j := range ps.monsters {
-				if i == j || ps.monsters[j].Dead {
+			for j := range p.monsters {
+				if i == j || p.monsters[j].Dead {
 					continue
 				}
-				ddx := newX - ps.monsters[j].Pos[0]
-				ddy := newY - ps.monsters[j].Pos[1]
+				ddx := newX - p.monsters[j].Pos[0]
+				ddy := newY - p.monsters[j].Pos[1]
 				if ddx*ddx+ddy*ddy < monsterSepRadius*monsterSepRadius {
 					overlap = true
 					break
@@ -757,26 +809,10 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 		}
 
 		// Gravity and ground snapping.
-		//
-		// monsterMoveTrace uses m.ClipNodes with HeadNodes[0]==0, which is the root
-		// of hull 1 (the player standing hull, 32×32×56). Hull 1 pre-expands solid
-		// surfaces 24 units upward (|mins[2]|), so the solid boundary in clip-node
-		// space sits at actual_floor_z + monsterHullOffset. Consequences:
-		//   • Traces starting below this boundary (e.g. monster origin at floor_z)
-		//     are StartSolid → Hit=false → gravity and wall detection break entirely.
-		//   • The correct physics resting position is floor_z + monsterHullOffset,
-		//     exactly where Quake's SV_DropToFloor places entity origins. MDL meshes
-		//     have their feet at approx z = -monsterHullOffset in model space, so
-		//     rendering at this origin puts feet visually at floor_z.
-		//
-		// Fix: always start vertical traces monsterHullOffset+1 above mn.Pos so the
-		// origin is safely above the expanded solid boundary. Do NOT subtract the
-		// offset from EndPos — mn.Pos should stay at floor_z+24 as the physics origin.
 		liftedZ := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] + monsterHullOffset + 1}
 		if mn.OnGround {
-			// Step-down: keep the monster glued to sloped or stepped floors.
 			groundEnd := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] - 8}
-			gtr := monsterMoveTrace(m, brushEnts, liftedZ, groundEnd)
+			gtr := monsterMoveTrace(p.m, p.mgr.Entities, liftedZ, groundEnd)
 			if gtr.Hit && gtr.Normal[2] > 0.7 {
 				mn.Pos[2] = gtr.EndPos[2]
 				mn.VelZ = 0
@@ -786,7 +822,7 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 		} else {
 			mn.VelZ -= gravity * dt
 			zEnd := [3]float32{mn.Pos[0], mn.Pos[1], mn.Pos[2] + mn.VelZ*dt}
-			tr := monsterMoveTrace(m, brushEnts, liftedZ, zEnd)
+			tr := monsterMoveTrace(p.m, p.mgr.Entities, liftedZ, zEnd)
 			if tr.Hit {
 				mn.Pos[2] = tr.EndPos[2]
 				if tr.Normal[2] > 0.7 {
@@ -803,33 +839,30 @@ func tickMonsters(m *bsp.Map, brushEnts []*entities.BrushEntity, ps *physicsStat
 		// Melee attack
 		mn.AttackCooldown -= dt
 		if mn.Alerted && dist < entities.MonsterMeleeDist && mn.AttackCooldown <= 0 {
-			ps.playerHP -= entities.MonsterDamage
+			p.Health -= entities.MonsterDamage
 			mn.AttackCooldown = entities.MonsterAttackCooldown
 		}
 	}
 }
 
 // emitBloodParticles sprays blood from origin toward the hit direction.
-func emitBloodParticles(ps *physicsState, origin [3]float32, fwdX, fwdY, fwdZ float32) {
+func emitBloodParticles(p *Physics, origin [3]float32, fwdX, fwdY, fwdZ float32) {
 	emitted := 0
 	for emitted < particleEmitCount {
-		// Find a free slot starting from the hint cursor.
 		found := false
-		for range ps.particles {
-			i := ps.nextFreeHint % particleCount
-			ps.nextFreeHint++
-			if !ps.particles[i].Active {
-				// Random cone spread around the forward vector.
+		for range p.particles {
+			i := p.nextFreeHint % particleCount
+			p.nextFreeHint++
+			if !p.particles[i].Active {
 				lx := fwdX + (rand.Float32()*2-1)*particleSpread
 				ly := fwdY + (rand.Float32()*2-1)*particleSpread
 				lz := fwdZ + (rand.Float32()*2-1)*particleSpread
-				// Normalise
 				mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
 				if mag < 1e-6 {
 					mag = 1
 				}
 				speed := particleSpeed * (0.5 + rand.Float32()*0.5)
-				ps.particles[i] = particle{
+				p.particles[i] = particle{
 					Pos:     origin,
 					Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
 					Life:    particleFlyLife,
@@ -849,9 +882,9 @@ func emitBloodParticles(ps *physicsState, origin [3]float32, fwdX, fwdY, fwdZ fl
 }
 
 // tickFlames advances flame animation frames (looping, no AI or physics).
-func tickFlames(ps *physicsState, dt float32) {
-	for i := range ps.flames {
-		f := &ps.flames[i]
+func tickFlames(p *Physics, dt float32) {
+	for i := range p.flames {
+		f := &p.flames[i]
 		f.FrameTime += dt * entities.MonsterFPS
 		for f.FrameTime >= 1.0 {
 			f.FrameTime -= 1.0
@@ -864,71 +897,71 @@ func tickFlames(ps *physicsState, dt float32) {
 }
 
 // tickParticles advances all active particles for one physics tick.
-func tickParticles(m *bsp.Map, ps *physicsState, dt float32) {
-	if len(m.ClipNodes) == 0 || len(m.Models) == 0 {
+func tickParticles(p *Physics, dt float32) {
+	if len(p.m.ClipNodes) == 0 || len(p.m.Models) == 0 {
 		return
 	}
-	pointHull := m.Models[0].HeadNodes[0]
-	for i := range ps.particles {
-		p := &ps.particles[i]
-		if !p.Active {
+	pointHull := p.m.Models[0].HeadNodes[0]
+	for i := range p.particles {
+		pt := &p.particles[i]
+		if !pt.Active {
 			continue
 		}
-		p.Life -= dt
-		if p.Life <= 0 {
-			p.Active = false
+		pt.Life -= dt
+		if pt.Life <= 0 {
+			pt.Active = false
 			continue
 		}
-		if p.Stuck {
+		if pt.Stuck {
 			continue
 		}
 		// Apply gravity
-		p.Vel[2] -= gravity * dt
+		pt.Vel[2] -= gravity * dt
 		end := [3]float32{
-			p.Pos[0] + p.Vel[0]*dt,
-			p.Pos[1] + p.Vel[1]*dt,
-			p.Pos[2] + p.Vel[2]*dt,
+			pt.Pos[0] + pt.Vel[0]*dt,
+			pt.Pos[1] + pt.Vel[1]*dt,
+			pt.Pos[2] + pt.Vel[2]*dt,
 		}
-		tr := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, p.Pos, end)
+		tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, pt.Pos, end)
 		if tr.StartSolid {
-			p.Stuck = true
-			if p.Life > particleStuckLife {
-				p.Life = particleStuckLife
-				p.MaxLife = p.Life
+			pt.Stuck = true
+			if pt.Life > particleStuckLife {
+				pt.Life = particleStuckLife
+				pt.MaxLife = pt.Life
 			}
 		} else if tr.Hit {
-			p.Pos = tr.EndPos
-			p.Vel = [3]float32{}
-			p.Stuck = true
-			if p.Life > particleStuckLife {
-				p.Life = particleStuckLife
-				p.MaxLife = p.Life
+			pt.Pos = tr.EndPos
+			pt.Vel = [3]float32{}
+			pt.Stuck = true
+			if pt.Life > particleStuckLife {
+				pt.Life = particleStuckLife
+				pt.MaxLife = pt.Life
 			}
 		} else {
-			p.Pos = end
+			pt.Pos = end
 		}
 	}
 }
 
-// buildParticleItems collects active particles into ps.particleScratch.
-func buildParticleItems(ps *physicsState) {
-	ps.particleScratch = ps.particleScratch[:0]
-	for i := range ps.particles {
-		p := &ps.particles[i]
-		if !p.Active {
+// buildParticleItems collects active particles into p.Particles.
+func buildParticleItems(p *Physics) {
+	p.particleScratch = p.particleScratch[:0]
+	for i := range p.particles {
+		pt := &p.particles[i]
+		if !pt.Active {
 			continue
 		}
 		life := float32(1)
-		if p.MaxLife > 0 {
-			life = p.Life / p.MaxLife
+		if pt.MaxLife > 0 {
+			life = pt.Life / pt.MaxLife
 		}
-		ps.particleScratch = append(ps.particleScratch, game.ParticleState{
-			Pos:   p.Pos,
+		p.particleScratch = append(p.particleScratch, ParticleState{
+			Pos:   pt.Pos,
 			Life:  life,
-			Stuck: p.Stuck,
+			Stuck: pt.Stuck,
 		})
 	}
-	ps.player.Particles = ps.particleScratch
+	p.Particles = p.particleScratch
 }
 
 // monsterMoveTrace traces a point through world + brush entities using the point hull.
@@ -937,7 +970,7 @@ func monsterMoveTrace(m *bsp.Map, brushEnts []*entities.BrushEntity, start, end 
 	best := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, start, end)
 	for _, ent := range brushEnts {
 		entModel := m.Models[ent.ModelIndex]
-		entHull := entModel.HeadNodes[1] // HeadNodes[1] = hull-1 clip root; HeadNodes[0] is the render-BSP root (wrong array)
+		entHull := entModel.HeadNodes[1]
 		mo := entModel.Origin
 		adjStart := [3]float32{
 			start[0] - mo[0] - ent.Offset[0],
@@ -1024,7 +1057,6 @@ func traceAll(m *bsp.Map, ents []*entities.BrushEntity, hull int32, start, end [
 		entModel := m.Models[ent.ModelIndex]
 		entHull := entModel.HeadNodes[1]
 		mo := entModel.Origin
-		// Adjust trace into entity local space (entity origin + current offset)
 		adjStart := [3]float32{
 			start[0] - mo[0] - ent.Offset[0],
 			start[1] - mo[1] - ent.Offset[1],
@@ -1037,7 +1069,6 @@ func traceAll(m *bsp.Map, ents []*entities.BrushEntity, hull int32, start, end [
 		}
 		tr := bsp.HullTrace(m.ClipNodes, m.Planes, int32(entHull), adjStart, adjEnd)
 		if tr.Hit && (!best.Hit || tr.Fraction < best.Fraction) {
-			// Translate end position back to world space
 			tr.EndPos = [3]float32{
 				tr.EndPos[0] + mo[0] + ent.Offset[0],
 				tr.EndPos[1] + mo[1] + ent.Offset[1],
@@ -1050,62 +1081,39 @@ func traceAll(m *bsp.Map, ents []*entities.BrushEntity, hull int32, start, end [
 }
 
 // noclip is the fallback movement when no clip hull is available.
-func noclip(m *bsp.Map, ps *physicsState, ev game.InputEvent, dt float32) {
-	yaw := float64(mgl32.DegToRad(ps.player.Yaw))
+func noclip(p *Physics, snap inputSnapshot, dt float32) {
+	yaw := float64(mgl32.DegToRad(p.Yaw))
 	fwd := [3]float32{float32(math.Cos(yaw)), float32(math.Sin(yaw)), 0}
 	right := [3]float32{float32(math.Sin(yaw)), float32(-math.Cos(yaw)), 0}
 	spd := moveSpeed * dt
 	move := mgl32.Vec3{}
-	if ev.Keys[glfw.KeyW] || ev.Keys[glfw.KeyUp] {
+	if snap.Keys[glfw.KeyW] || snap.Keys[glfw.KeyUp] {
 		move = move.Add(mgl32.Vec3(fwd).Mul(spd))
 	}
-	if ev.Keys[glfw.KeyS] || ev.Keys[glfw.KeyDown] {
+	if snap.Keys[glfw.KeyS] || snap.Keys[glfw.KeyDown] {
 		move = move.Sub(mgl32.Vec3(fwd).Mul(spd))
 	}
-	if ev.Keys[glfw.KeyA] {
+	if snap.Keys[glfw.KeyA] {
 		move = move.Sub(mgl32.Vec3(right).Mul(spd))
 	}
-	if ev.Keys[glfw.KeyD] {
+	if snap.Keys[glfw.KeyD] {
 		move = move.Add(mgl32.Vec3(right).Mul(spd))
 	}
-	if ev.Keys[glfw.KeySpace] {
+	if snap.Keys[glfw.KeySpace] {
 		move[2] += spd
 	}
-	if ev.Keys[glfw.KeyLeftControl] || ev.Keys[glfw.KeyC] {
+	if snap.Keys[glfw.KeyLeftControl] || snap.Keys[glfw.KeyC] {
 		move[2] -= spd
 	}
-	ps.player.Position = ps.player.Position.Add(move)
-	ps.player.LeafIndex = vis.LeafForPoint(m, [3]float32(ps.player.Position))
-	ps.player.InWater = ps.player.LeafIndex < len(m.Leaves) && m.Leaves[ps.player.LeafIndex].Contents == bsp.ContentsWater
+	p.Pos = p.Pos.Add(move)
+	p.LeafIndex = bsp.LeafForPoint(p.m, [3]float32(p.Pos))
+	p.InWater = p.LeafIndex < len(p.m.Leaves) && p.m.Leaves[p.LeafIndex].Contents == bsp.ContentsWater
 
-	tickWeapon(ps, ev, dt)
-	tickMonsters(m, nil, ps, dt)
-	tickParticles(m, ps, dt)
-	tickFlames(ps, dt)
+	tickWeapon(p, snap, dt)
+	tickMonsters(p, dt)
+	tickParticles(p, dt)
+	tickFlames(p, dt)
 
-	ps.player.Health = ps.playerHP
-	ps.player.WeaponFrame = ps.weaponFrame
-	ps.player.CurrentWeapon = ps.currentWeapon
-	ps.player.WeaponAmmo = ps.ammo
-	ps.player.MonsterItems = ps.player.MonsterItems[:0]
-	for _, mn := range ps.monsters {
-		if mn.Dead {
-			continue
-		}
-		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
-			Pos:    mn.Pos,
-			MdlIdx: mn.MdlIdx,
-			Frame:  mn.FrameIdx,
-			Yaw:    mn.Yaw,
-		})
-	}
-	for _, f := range ps.flames {
-		ps.player.MonsterItems = append(ps.player.MonsterItems, game.ItemState{
-			Pos:    f.Pos,
-			MdlIdx: f.MdlIdx,
-			Frame:  f.FrameIdx,
-		})
-	}
-
-	buildParticleItems(ps)
+	buildParticleItems(p)
+	p.buildItems()
 }

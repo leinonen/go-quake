@@ -396,6 +396,19 @@ func autoSwitchWeapon(p *Physics) {
 	}
 }
 
+// CurrentWeaponAmmo returns the current and maximum ammo for the active weapon.
+// Both values are 0 for the axe (melee, no ammo).
+func (p *Physics) CurrentWeaponAmmo() (current, max int) {
+	if p.Weapon < 0 || p.Weapon >= len(weaponAmmoReq) {
+		return 0, 0
+	}
+	at := weaponAmmoReq[p.Weapon][0]
+	if at == entities.AmmoNone || at >= len(ammoCaps) {
+		return 0, 0
+	}
+	return p.Ammo[at], ammoCaps[at]
+}
+
 // tickWeapon dispatches to the active weapon's tick and handles weapon switching.
 func tickWeapon(p *Physics, snap inputSnapshot, dt float32) {
 	// Weapon switching via keys 1–8.

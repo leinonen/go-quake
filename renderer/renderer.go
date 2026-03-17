@@ -746,29 +746,55 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 				gl.BindTexture(gl.TEXTURE_2D, 0)
 			}
 		} else if r.hudGradProg != 0 {
-			// Gradient fallback path.
+			// Gradient fallback path: health bar (left half) + ammo bar (right half).
+			gl.UseProgram(r.hudGradProg)
+			gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
+			gl.BindVertexArray(r.hudVAO)
+
+			// Health bar: x ∈ [-1, 0]
 			frac := float32(p.Health) / 100.0
 			if frac < 0 {
 				frac = 0
 			} else if frac > 1 {
 				frac = 1
 			}
-			gradVerts := [24]float32{
+			healthVerts := [24]float32{
 				-1, -1, 0, 0,
-				1, -1, 1, 0,
-				1, -0.97, 1, 1,
+				0, -1, 1, 0,
+				0, -0.97, 1, 1,
 				-1, -1, 0, 0,
-				1, -0.97, 1, 1,
+				0, -0.97, 1, 1,
 				-1, -0.97, 0, 1,
 			}
-			gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
-			gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(gradVerts)*4, unsafe.Pointer(&gradVerts[0]))
-			gl.BindBuffer(gl.ARRAY_BUFFER, 0)
-			gl.UseProgram(r.hudGradProg)
+			gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(healthVerts)*4, unsafe.Pointer(&healthVerts[0]))
 			gl.Uniform1f(r.hudFracLoc, frac)
-			gl.BindVertexArray(r.hudVAO)
 			gl.DrawArrays(gl.TRIANGLES, 0, 6)
+
+			// Ammo bar: x ∈ [0, 1]
+			cur, maxAmmo := p.CurrentWeaponAmmo()
+			ammoFrac := float32(0)
+			if maxAmmo > 0 {
+				ammoFrac = float32(cur) / float32(maxAmmo)
+				if ammoFrac < 0 {
+					ammoFrac = 0
+				} else if ammoFrac > 1 {
+					ammoFrac = 1
+				}
+			}
+			ammoVerts := [24]float32{
+				0, -1, 0, 0,
+				1, -1, 1, 0,
+				1, -0.97, 1, 1,
+				0, -1, 0, 0,
+				1, -0.97, 1, 1,
+				0, -0.97, 0, 1,
+			}
+			gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(ammoVerts)*4, unsafe.Pointer(&ammoVerts[0]))
+			gl.Uniform1f(r.hudFracLoc, ammoFrac)
+			gl.DrawArrays(gl.TRIANGLES, 0, 6)
+
 			gl.BindVertexArray(0)
+			gl.BindBuffer(gl.ARRAY_BUFFER, 0)
 		}
 
 		gl.Disable(gl.BLEND)
@@ -1247,11 +1273,7 @@ func (r *Renderer) buildHUDVerts(p *physics.Physics) ([]float32, int) {
 	}
 
 	// 4. Ammo digits at vx=248.
-	ammo := 0
-	cw := p.Weapon
-	if cw >= 0 && cw < len(p.Ammo) {
-		ammo = p.Ammo[cw]
-	}
+	ammo, _ := p.CurrentWeaponAmmo()
 	if ammo < 0 {
 		ammo = 0
 	}

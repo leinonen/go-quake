@@ -1,6 +1,9 @@
 package entities
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+)
 
 // AnimRange is an inclusive [Start, End] frame index range within an MDL.
 type AnimRange struct{ Start, End int }
@@ -17,6 +20,29 @@ const (
 	AnimPain
 	AnimDead
 )
+
+// monsterDeathSounds maps MDL basename (without .mdl) to its PAK death sound path.
+var monsterDeathSounds = map[string]string{
+	"soldier":   "sound/soldier/death1.wav",
+	"dog":       "sound/dog/death1.wav",
+	"ogre":      "sound/ogre/death1.wav",
+	"zombie":    "sound/zombie/z_die.wav",
+	"knight":    "sound/knight/death1.wav",
+	"hknight":   "sound/hknight/death1.wav",
+	"shambler":  "sound/shambler/sdeath.wav",
+	"demon":     "sound/demon/ddeath.wav",
+	"shalrath":  "sound/shalrath/death.wav",
+	"wizard":    "sound/wizard/wdeath.wav",
+	"enforcer":  "sound/enforcer/death1.wav",
+	"tarbaby":   "sound/tarbaby/death.wav",
+}
+
+// MonsterDeathSound returns the PAK death sound path for the given MDL path.
+// Returns "" if no mapping is known.
+func MonsterDeathSound(mdlPath string) string {
+	base := strings.TrimSuffix(filepath.Base(mdlPath), ".mdl")
+	return monsterDeathSounds[base]
+}
 
 // MonsterState holds the runtime state for one monster instance.
 type MonsterState struct {
@@ -39,6 +65,7 @@ type MonsterState struct {
 	RunRange       AnimRange
 	PainRange      AnimRange
 	DeadRange      AnimRange
+	DeathSoundPath string // PAK path for this monster's death sound; "" if unknown
 }
 
 // FlameState holds runtime animation state for one flame entity.
@@ -80,17 +107,18 @@ func NewMonsterState(sp ItemSpawn, mdlIdx int, frameNames []string) MonsterState
 	dead := findAnimRange(frameNames, "death", "die", "dth")
 
 	return MonsterState{
-		Spawn:     sp,
-		Pos:       sp.Pos,
-		HP:        MonsterHP,
-		PrevHP:    MonsterHP,
-		NumFrames: nf,
-		MdlIdx:    mdlIdx,
-		FrameIdx:  idle.Start,
-		IdleRange: idle,
-		RunRange:  run,
-		PainRange: pain,
-		DeadRange: dead,
+		Spawn:          sp,
+		Pos:            sp.Pos,
+		HP:             MonsterHP,
+		PrevHP:         MonsterHP,
+		NumFrames:      nf,
+		MdlIdx:         mdlIdx,
+		FrameIdx:       idle.Start,
+		IdleRange:      idle,
+		RunRange:       run,
+		PainRange:      pain,
+		DeadRange:      dead,
+		DeathSoundPath: MonsterDeathSound(sp.ModelPath),
 	}
 }
 

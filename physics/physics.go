@@ -8,6 +8,7 @@ import (
 	"github.com/go-gl/mathgl/mgl32"
 	"go-quake/bsp"
 	"go-quake/entities"
+	"go-quake/sound"
 )
 
 const (
@@ -79,6 +80,10 @@ type Physics struct {
 	Particles  []ParticleState
 	Items      []ItemState // visible world items + live monsters + flames (combined)
 
+	// Sound events accumulated during Tick; read by main.go, cleared at top of each Tick.
+	SoundEvents []sound.SoundEvent
+	SoundPaths  []string // path-keyed sounds (e.g. monster death sounds)
+
 	// private weapon state
 	weaponFrameTime  float32
 	weaponSwinging   bool
@@ -147,6 +152,8 @@ func New(win *glfw.Window, m *bsp.Map, mgr *entities.Manager, spawn mgl32.Vec3,
 
 // Tick advances physics by dt seconds. Must be called from the GL/main thread.
 func (p *Physics) Tick(dt float32) {
+	p.SoundEvents = p.SoundEvents[:0]
+	p.SoundPaths = p.SoundPaths[:0]
 	snap := p.readInput()
 
 	// Mouse look
@@ -257,6 +264,7 @@ func (p *Physics) Tick(dt float32) {
 		dz := foot[2] - item.Pos[2]
 		if dx*dx+dy*dy+dz*dz < pickupRadius*pickupRadius {
 			p.picked[i] = true
+			p.SoundEvents = append(p.SoundEvents, sound.SndItemPickup)
 			if item.HealthValue > 0 {
 				p.Health += item.HealthValue
 				if p.Health > 100 {
@@ -455,6 +463,7 @@ func tickAxe(p *Physics, snap inputSnapshot, dt float32) {
 		p.WeaponFrame = 1
 		p.weaponFrameTime = 0
 		p.hitFired = false
+		p.SoundEvents = append(p.SoundEvents, sound.SndAxeSwing)
 	}
 
 	if !p.weaponSwinging {
@@ -490,15 +499,18 @@ func tickShotgun(p *Physics, snap inputSnapshot, dt float32) {
 		cost := 1
 		pellets := 6
 		spread := float32(0.06)
+		snd := sound.SndShotgun
 		if p.Weapon == entities.WeaponSuperShotgun {
 			cost = 2
 			pellets = 14
 			spread = 0.12
+			snd = sound.SndSuperShotgun
 		}
 		if p.Ammo[entities.AmmoShells] >= cost {
 			p.Ammo[entities.AmmoShells] -= cost
 			fireHitscan(p, pellets, spread, 4)
 			startRangedAnim(p)
+			p.SoundEvents = append(p.SoundEvents, snd)
 		}
 	}
 	p.mouseWasDown = mouseDown
@@ -519,15 +531,18 @@ func tickNailgun(p *Physics, snap inputSnapshot, dt float32) {
 	}
 	cost := 1
 	damage := 9
+	sndNail := sound.SndNailgun
 	if p.Weapon == entities.WeaponSuperNailgun {
 		cost = 2
 		damage = 18
+		sndNail = sound.SndSuperNailgun
 	}
 	if p.Ammo[entities.AmmoNails] >= cost {
 		p.Ammo[entities.AmmoNails] -= cost
 		fireHitscan(p, 1, 0, damage)
 		p.fireCooldown = 0.1
 		startRangedAnim(p)
+		p.SoundEvents = append(p.SoundEvents, sndNail)
 	}
 }
 
@@ -537,13 +552,16 @@ func tickRocket(p *Physics, snap inputSnapshot, dt float32) { //nolint
 	mouseDown := snap.MouseButtons[0]
 	if mouseDown && !p.mouseWasDown {
 		damage := 100
+		sndRocket := sound.SndGrenade
 		if p.Weapon == entities.WeaponRocketLauncher {
 			damage = 120
+			sndRocket = sound.SndRocket
 		}
 		if p.Ammo[entities.AmmoRockets] > 0 {
 			p.Ammo[entities.AmmoRockets]--
 			fireHitscan(p, 1, 0, damage)
 			startRangedAnim(p)
+			p.SoundEvents = append(p.SoundEvents, sndRocket)
 		}
 	}
 	p.mouseWasDown = mouseDown
@@ -567,6 +585,7 @@ func tickLightning(p *Physics, snap inputSnapshot, dt float32) {
 		fireHitscan(p, 1, 0, 30)
 		p.fireCooldown = 0.05
 		startRangedAnim(p)
+		p.SoundEvents = append(p.SoundEvents, sound.SndLightning)
 	}
 }
 
@@ -687,6 +706,7 @@ func tryAxeHit(p *Physics) {
 				mn.HP = 0
 			}
 			emitBloodParticles(p, mn.Pos, fwdX, fwdY, fwdZ)
+			p.SoundEvents = append(p.SoundEvents, sound.SndAxeHit)
 		}
 	}
 }
@@ -715,6 +735,9 @@ func tickMonsters(p *Physics, dt float32) {
 				mn.FrameIdx = mn.DeadRange.Start
 			} else {
 				mn.Dead = true // no death animation available — remove immediately
+			}
+			if mn.DeathSoundPath != "" {
+				p.SoundPaths = append(p.SoundPaths, mn.DeathSoundPath)
 			}
 		}
 

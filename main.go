@@ -23,6 +23,7 @@ import (
 	"go-quake/pak"
 	"go-quake/physics"
 	"go-quake/renderer"
+	"go-quake/sound"
 )
 
 func init() {
@@ -85,6 +86,7 @@ func main() {
 	var monsterStates []entities.MonsterState
 	var flameStates []entities.FlameState
 	var hudAssets *renderer.HUDAssets
+	var pakReadFile func(string) ([]byte, error) // set when PAK is open
 
 	switch {
 	case *pakPath != "":
@@ -94,6 +96,7 @@ func main() {
 			log.Fatalf("open pak dir: %v", err)
 		}
 		defer p.Close()
+		pakReadFile = p.ReadFile
 
 		// If no map specified, list available maps and exit
 		if *mapName == "" {
@@ -258,6 +261,25 @@ func main() {
 	log.Printf("BSP loaded: %d leaves, %d nodes, %d faces, %d vertices",
 		len(m.Leaves), len(m.Nodes), len(m.Faces), len(m.Vertices))
 
+	// Sound init — best-effort; silently continues without audio if it fails.
+	if pakReadFile != nil {
+		if err := sound.Init(pakReadFile); err != nil {
+			log.Printf("sound init failed: %v (continuing without audio)", err)
+		} else {
+			defer sound.Cleanup()
+			// Pre-load unique monster death sounds for this map.
+			var deathPaths []string
+			seen := map[string]bool{}
+			for _, ms := range monsterStates {
+				if ms.DeathSoundPath != "" && !seen[ms.DeathSoundPath] {
+					deathPaths = append(deathPaths, ms.DeathSoundPath)
+					seen[ms.DeathSoundPath] = true
+				}
+			}
+			sound.PreloadPaths(deathPaths, pakReadFile)
+		}
+	}
+
 	// Spawn position
 	var spawn mgl32.Vec3
 	if org, ok := m.SpawnPoint(); ok {
@@ -338,6 +360,13 @@ func main() {
 
 		glfw.PollEvents()
 		phys.Tick(dt)
+
+		for _, ev := range phys.SoundEvents {
+			sound.Play(ev)
+		}
+		for _, path := range phys.SoundPaths {
+			sound.PlayPath(path)
+		}
 
 		w, h := win.GetFramebufferSize()
 		gl.Viewport(0, 0, int32(w), int32(h))

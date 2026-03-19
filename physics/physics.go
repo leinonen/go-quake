@@ -28,6 +28,18 @@ const (
 	particleSpread    = 1.4   // lateral cone factor
 	particleEmitCount = 80    // per hit
 
+	particleKindBlood = 0
+	particleKindSpark = 1
+
+	sparkEmitCount = 12    // sparks per pellet wall hit
+	sparkFlyLife   = 1.5   // seconds airborne
+	sparkStuckLife = 2.0   // seconds as decal
+	sparkSpeed     = 300.0 // units/s base
+	sparkSpread    = 1.2   // lateral cone factor
+
+	tracerCount    = 128
+	tracerLifetime = 0.05 // seconds (very brief flash)
+
 	monsterSepRadius  = 28.0 // minimum XY distance between monster centers
 	monsterHullOffset = 24   // hull 1 bottom extent below entity origin (Quake standing hull)
 )
@@ -40,19 +52,34 @@ type ItemState struct {
 	Yaw    float32 // facing angle in radians (world Z rotation); 0 = +X direction
 }
 
-// ParticleState carries the world position and lifetime for one blood particle.
+// ParticleState carries the world position and lifetime for one particle.
 type ParticleState struct {
 	Pos   [3]float32
 	Life  float32 // normalised 0..1 remaining lifetime (for alpha fade)
 	Stuck bool
+	Kind  uint8 // particleKindBlood or particleKindSpark
 }
 
-// particle is an internal blood particle.
+// TracerState carries the world-space endpoints and normalised lifetime for one bullet tracer.
+type TracerState struct {
+	From, To [3]float32
+	Life     float32 // normalised 0..1
+}
+
+// particle is an internal particle (blood or spark).
 type particle struct {
 	Pos, Vel [3]float32
 	Life     float32
 	MaxLife  float32
 	Stuck    bool
+	Active   bool
+	Kind     uint8
+}
+
+// tracer is an internal bullet tracer line segment.
+type tracer struct {
+	From, To [3]float32
+	Life     float32
 	Active   bool
 }
 
@@ -78,6 +105,7 @@ type Physics struct {
 	InWater    bool
 	Entities   []entities.EntityState
 	Particles  []ParticleState
+	Tracers    []TracerState
 	Items      []ItemState // visible world items + live monsters + flames (combined)
 
 	// Sound events accumulated during Tick; read by main.go, cleared at top of each Tick.
@@ -105,6 +133,10 @@ type Physics struct {
 	particles       [particleCount]particle
 	particleScratch []ParticleState
 	nextFreeHint    int
+
+	// private tracer pool
+	tracers       [tracerCount]tracer
+	tracerScratch []TracerState
 
 	// private item data
 	itemSpawns []entities.ItemSpawn
@@ -145,6 +177,7 @@ func New(win *glfw.Window, m *bsp.Map, mgr *entities.Manager, spawn mgl32.Vec3,
 	}
 	p.hasWeapon[0] = true // axe always owned
 	p.particleScratch = make([]ParticleState, 0, particleCount)
+	p.tracerScratch = make([]TracerState, 0, tracerCount)
 	p.LeafIndex = bsp.LeafForPoint(m, [3]float32(p.Pos))
 	p.InWater = p.LeafIndex < len(m.Leaves) && m.Leaves[p.LeafIndex].Contents == bsp.ContentsWater
 	return p
@@ -249,8 +282,9 @@ func (p *Physics) Tick(dt float32) {
 	// Monster tick (pass brush entities for door collision)
 	tickMonsters(p, dt)
 
-	// Particle tick
+	// Particle + tracer tick
 	tickParticles(p, dt)
+	tickTracers(p, dt)
 	tickFlames(p, dt)
 
 	// Check item pickups against player foot origin.
@@ -313,6 +347,7 @@ func (p *Physics) Tick(dt float32) {
 	}
 
 	buildParticleItems(p)
+	buildTracerItems(p)
 	p.buildItems()
 }
 
@@ -642,7 +677,8 @@ func advanceRangedAnim(p *Physics, dt float32, loop bool) {
 }
 
 // fireHitscan fires numPellets rays from the player eye with optional spread.
-// Each pellet tests all live monsters using a ray-vs-sphere closest-point check.
+// Each pellet tests all live monsters using a ray-vs-sphere closest-point check,
+// then traces the world geometry to emit wall sparks and a bullet tracer.
 func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
 	eyePos := [3]float32(p.Pos)
 	yaw := float64(mgl32.DegToRad(p.Yaw))
@@ -653,6 +689,8 @@ func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
 
 	const rayLen = 2048.0
 	const hitRadius = 40.0
+
+	pointHull := p.m.Models[0].HeadNodes[0]
 
 	for pellet := 0; pellet < numPellets; pellet++ {
 		dx, dy, dz := baseFwdX, baseFwdY, baseFwdZ
@@ -668,6 +706,10 @@ func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
 			dy /= mag
 			dz /= mag
 		}
+
+		hitT := float32(rayLen)
+		monsterHit := false
+		var monsterHitPos [3]float32
 
 		for i := range p.monsters {
 			mn := &p.monsters[i]
@@ -692,9 +734,55 @@ func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
 				if mn.HP < 0 {
 					mn.HP = 0
 				}
-				emitBloodParticles(p, mn.Pos, dx, dy, dz)
+				if t < hitT {
+					hitT = t
+					monsterHitPos = mn.Pos
+				}
+				monsterHit = true
 			}
 		}
+
+		// World geometry trace up to the closest hit point.
+		endPos := [3]float32{
+			eyePos[0] + dx*hitT,
+			eyePos[1] + dy*hitT,
+			eyePos[2] + dz*hitT,
+		}
+		tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, eyePos, endPos)
+
+		var hitPoint [3]float32
+		if tr.Hit {
+			hitPoint = tr.EndPos
+			if !monsterHit {
+				emitWallSparks(p, tr.EndPos, tr.Normal[0], tr.Normal[1], tr.Normal[2])
+			}
+		} else {
+			hitPoint = endPos
+		}
+
+		if monsterHit {
+			emitBloodParticles(p, monsterHitPos, dx, dy, dz)
+		}
+
+		emitTracer(p, muzzlePos(eyePos, baseFwdX, baseFwdY, baseFwdZ, yaw, pitch), hitPoint)
+	}
+}
+
+// muzzlePos returns the approximate world-space weapon muzzle position.
+// It mirrors the weapon render offset: Translate3D(0, -10, -10) in GL camera space
+// = 10 units forward + 10 units down from the eye.
+func muzzlePos(eye [3]float32, fwdX, fwdY, fwdZ float32, yaw, pitch float64) [3]float32 {
+	// Up vector in world space (Z-up, pitched)
+	upX := float32(-math.Sin(pitch) * math.Cos(yaw))
+	upY := float32(-math.Sin(pitch) * math.Sin(yaw))
+	upZ := float32(math.Cos(pitch))
+
+	const fwdOff = 10.0
+	const upOff = -10.0
+	return [3]float32{
+		eye[0] + fwdX*fwdOff + upX*upOff,
+		eye[1] + fwdY*fwdOff + upY*upOff,
+		eye[2] + fwdZ*fwdOff + upZ*upOff,
 	}
 }
 
@@ -926,6 +1014,7 @@ func emitBloodParticles(p *Physics, origin [3]float32, fwdX, fwdY, fwdZ float32)
 					MaxLife: particleFlyLife,
 					Active:  true,
 					Stuck:   false,
+					Kind:    particleKindBlood,
 				}
 				found = true
 				break
@@ -936,6 +1025,88 @@ func emitBloodParticles(p *Physics, origin [3]float32, fwdX, fwdY, fwdZ float32)
 		}
 		emitted++
 	}
+}
+
+// emitWallSparks sprays spark particles from a wall impact point in the hemisphere around the surface normal.
+func emitWallSparks(p *Physics, origin [3]float32, nx, ny, nz float32) {
+	emitted := 0
+	for emitted < sparkEmitCount {
+		found := false
+		for range p.particles {
+			i := p.nextFreeHint % particleCount
+			p.nextFreeHint++
+			if !p.particles[i].Active {
+				lx := nx + (rand.Float32()*2-1)*sparkSpread
+				ly := ny + (rand.Float32()*2-1)*sparkSpread
+				lz := nz + (rand.Float32()*2-1)*sparkSpread
+				mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
+				if mag < 1e-6 {
+					mag = 1
+				}
+				speed := sparkSpeed * (0.5 + rand.Float32()*0.5)
+				p.particles[i] = particle{
+					Pos:     origin,
+					Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
+					Life:    sparkFlyLife,
+					MaxLife: sparkFlyLife,
+					Active:  true,
+					Stuck:   false,
+					Kind:    particleKindSpark,
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+		emitted++
+	}
+}
+
+// emitTracer adds a bullet tracer line segment to the pool.
+func emitTracer(p *Physics, from, to [3]float32) {
+	for i := range p.tracers {
+		if !p.tracers[i].Active {
+			p.tracers[i] = tracer{
+				From:   from,
+				To:     to,
+				Life:   tracerLifetime,
+				Active: true,
+			}
+			return
+		}
+	}
+}
+
+// tickTracers decays all active tracers.
+func tickTracers(p *Physics, dt float32) {
+	for i := range p.tracers {
+		if !p.tracers[i].Active {
+			continue
+		}
+		p.tracers[i].Life -= dt
+		if p.tracers[i].Life <= 0 {
+			p.tracers[i].Active = false
+		}
+	}
+}
+
+// buildTracerItems collects active tracers into p.Tracers.
+func buildTracerItems(p *Physics) {
+	p.tracerScratch = p.tracerScratch[:0]
+	for i := range p.tracers {
+		tr := &p.tracers[i]
+		if !tr.Active {
+			continue
+		}
+		p.tracerScratch = append(p.tracerScratch, TracerState{
+			From: tr.From,
+			To:   tr.To,
+			Life: tr.Life / tracerLifetime,
+		})
+	}
+	p.Tracers = p.tracerScratch
 }
 
 // tickFlames advances flame animation frames (looping, no AI or physics).
@@ -979,19 +1150,23 @@ func tickParticles(p *Physics, dt float32) {
 			pt.Pos[1] + pt.Vel[1]*dt,
 			pt.Pos[2] + pt.Vel[2]*dt,
 		}
+		stuckLife := float32(particleStuckLife)
+		if pt.Kind == particleKindSpark {
+			stuckLife = sparkStuckLife
+		}
 		tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, pt.Pos, end)
 		if tr.StartSolid {
 			pt.Stuck = true
-			if pt.Life > particleStuckLife {
-				pt.Life = particleStuckLife
+			if pt.Life > stuckLife {
+				pt.Life = stuckLife
 				pt.MaxLife = pt.Life
 			}
 		} else if tr.Hit {
 			pt.Pos = tr.EndPos
 			pt.Vel = [3]float32{}
 			pt.Stuck = true
-			if pt.Life > particleStuckLife {
-				pt.Life = particleStuckLife
+			if pt.Life > stuckLife {
+				pt.Life = stuckLife
 				pt.MaxLife = pt.Life
 			}
 		} else {
@@ -1016,6 +1191,7 @@ func buildParticleItems(p *Physics) {
 			Pos:   pt.Pos,
 			Life:  life,
 			Stuck: pt.Stuck,
+			Kind:  pt.Kind,
 		})
 	}
 	p.Particles = p.particleScratch
@@ -1169,8 +1345,10 @@ func noclip(p *Physics, snap inputSnapshot, dt float32) {
 	tickWeapon(p, snap, dt)
 	tickMonsters(p, dt)
 	tickParticles(p, dt)
+	tickTracers(p, dt)
 	tickFlames(p, dt)
 
 	buildParticleItems(p)
+	buildTracerItems(p)
 	p.buildItems()
 }

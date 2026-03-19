@@ -57,10 +57,12 @@ renderer/
     weapon.frag.glsl   — skin texture with grey desaturation + ambient dim to match world look
     hud.vert.glsl      — emits NDC quad vertices, passes vUV across bar width
     hud.frag.glsl      — health bar: discards pixels where vUV.x > uFrac; colour transitions green→red
-    particle.vert.glsl — GL_POINTS with depth-scaled point size (2–16px); passes vLife, vStuck
-    particle.frag.glsl — circular disc via gl_PointCoord; fresh red → dried dark red; alpha = edge * vLife
+    particle.vert.glsl — GL_POINTS with depth-scaled point size (2–16px); passes vLife, vStuck, vKind
+    particle.frag.glsl — circular disc via gl_PointCoord; branches on vKind: blood = red, spark = orange→grey; alpha = edge * vLife
     underwater.vert.glsl — fullscreen NDC quad passthrough; computes vUV from aPos
     underwater.frag.glsl — blue-green tint (vec4(0.0, 0.25, 0.45, 0.35)) with animated ripple via uTime
+    tracer.vert.glsl   — passes world-space aPos through uMVP; passes aLife as vLife
+    tracer.frag.glsl   — bright yellow-white line with alpha = vLife * 0.85; additively blended
 physics/
   physics.go         — WASD + mouselook, gravity, jumping, BSP collision, weapon swing, monster AI; own goroutine
 input/
@@ -152,11 +154,11 @@ BSP29 lightmaps are 1 byte per texel (grayscale luminance). `BuildLightmapAtlas`
 
 `progs/v_axe.mdl` is loaded from the PAK at startup via `mdl.Load`. All animation frames are built into separate VAOs (interleaved `x,y,z,u,v`, 5 floats per vertex, no index buffer). The skin texture is uploaded once and shared across frames.
 
-Draw order: world → brush entities → skybox → items/monsters → **particles** (blend on, depth write off) → (depth clear) → **weapon** → **underwater tint** → **HUD**.
+Draw order: world → brush entities → skybox → items/monsters → **particles** (blend on, depth write off) → **tracers** (additive blend, depth write off) → (depth clear) → **weapon** → **underwater tint** → **HUD**.
 
 The weapon is positioned in GL camera space via:
 - `RotX(-90) * RotZ(90)` — converts Quake view space (X=forward, -Y=right, Z=up) to GL camera space (-Z=forward, +X=right, +Y=up)
-- `Translate3D(16, -10, -25)` — places it in the lower-right of the view
+- `Translate3D(0, -10, -10)` — places it in the lower-centre of the view
 
 The active VAO is selected each frame by `frame.Player.WeaponFrame`. If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
 
@@ -234,26 +236,42 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.
 - Player respawn: death teleports back to spawn with full HP and reset monster alert state.
 - HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
-- Blood particles: axe hits spray ~80 physics-simulated GL_POINTS in a wide cone; pool of 2048; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
+- Blood particles: axe hits spray ~80 physics-simulated GL_POINTS in a wide cone; pool of 2048 shared with sparks; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
+- Wall sparks: hitscan pellets that strike BSP geometry emit 12 orange spark particles (`particleKindSpark`) per pellet; share the 2048-slot particle pool with blood; stuck decals fade in 2s; fragment shader branches on `vKind` for colour (orange→grey vs red).
+- Bullet tracers: each hitscan pellet emits a `tracer` line segment from the weapon muzzle (`muzzlePos`: eye + forward×10 − up×10) to the impact point; pool of 128; lifetime 50 ms; exported as `[]TracerState` (normalised life); rendered as `GL_LINES` with additive blending (`GL_ONE`) in `tracer.vert/frag.glsl`.
 - Flame entities: `light_flame_large_yellow`, `light_flame_small_yellow`, `light_flame_large_white`, `light_flame_small_white` parsed from the entity lump; rendered as looping `flame2.mdl` animation via the existing `itemVAOs` path; no AI, no collision, no pickup.
 - Sound: OpenAL audio for all weapons (axe, shotgun, super shotgun, nailgun, super nailgun, rocket, grenade, lightning), item pickup, and per-monster death cries; 16-source pool; accumulated in physics goroutine and drained by main each frame; silently skipped if PAK or OpenAL unavailable.
 
-## blood particle system
+## particle system
 
-Pool of 2048 `particle` structs owned by the physics goroutine (`physics/physics.go`). Each tick, `tickParticles` runs:
+Pool of 2048 `particle` structs (blood + sparks) owned by the physics goroutine (`physics/physics.go`). Each `particle` carries a `Kind` field (`particleKindBlood=0`, `particleKindSpark=1`). Each tick, `tickParticles` runs:
 - **Life decay:** `Life -= dt`; deactivate when `Life ≤ 0`
 - **Flying:** gravity applied (`Vel[2] -= 800*dt`), then `HullTrace` against world point hull
-  - Hit → `Pos = tr.EndPos`, zero velocity, `Stuck = true`, clamp `Life = min(Life, 7s)`
+  - Hit → `Pos = tr.EndPos`, zero velocity, `Stuck = true`, clamp `Life = min(Life, stuckLife)` where `stuckLife` is 7s for blood, 2s for sparks
   - `StartSolid` → mark stuck immediately
   - No hit → advance `Pos`
 - **Stuck:** no movement; just fade
 
-`emitBloodParticles` is called from `tryAxeHit` on each monster hit:
+**Blood** (`emitBloodParticles`): called from `tryAxeHit` on monster hit and from `fireHitscan` on monster hit:
 - Scans `particles[]` from `nextFreeHint` (amortised cursor) for free slots
-- Sprays `particleEmitCount=80` particles with random cone spread (`particleSpread=1.4`) around the forward vector
-- Speed: `350 * rand(0.5..1.0)` units/s
+- Sprays `particleEmitCount=80` particles with random cone spread (`particleSpread=1.4`) around the forward vector; speed `350 * rand(0.5..1.0)` units/s
 
-Live particles flow to the renderer via `PlayerState.Particles []ParticleState` (normalised life + stuck flag). Renderer packs 5 floats per particle (x,y,z,life,stuck) into a dynamic VBO each frame.
+**Sparks** (`emitWallSparks`): called from `fireHitscan` when a pellet hits BSP geometry (no closer monster hit):
+- Sprays `sparkEmitCount=12` particles in the hemisphere around the surface normal; speed `300 * rand(0.5..1.0)` units/s; spread factor 1.2
+
+Live particles flow to the renderer via `PlayerState.Particles []ParticleState` (normalised life + stuck + kind). Renderer packs 6 floats per particle `(x,y,z,life,stuck,kind)` into a dynamic VBO; particle fragment shader branches on `vKind` for colour.
+
+## bullet tracer system
+
+Pool of 128 `tracer` structs owned by the physics goroutine. Each tracer is a world-space line segment with a 50 ms lifetime.
+
+**Emission** (`emitTracer`): called from `fireHitscan` once per pellet after the world trace. Start point is `muzzlePos(eye, fwd, yaw, pitch)` = eye + forward×10 − up×10, matching the weapon render offset `Translate3D(0, -10, -10)` in GL camera space. End point is the impact point (world trace hit, monster position, or ray end).
+
+**Tick** (`tickTracers`): `Life -= dt`; deactivated when `Life ≤ 0`.
+
+**Export** (`buildTracerItems`): active tracers collected into `Physics.Tracers []TracerState` (From, To, normalised Life).
+
+**Rendering**: packed as 2 vertices per tracer × 4 floats `(x,y,z,life)`; drawn as `GL_LINES` with additive blending (`GL_SRC_ALPHA, GL_ONE`), depth write off. Fragment shader fades white→yellow as life decays.
 
 ## flame entity system
 

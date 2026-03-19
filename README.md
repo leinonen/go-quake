@@ -49,6 +49,8 @@ go run . -map /path/to/e1m1.bsp
 - **Flame entities** — `light_flame_*` classnames parsed and rendered as animated `flame2.mdl`; purely decorative, no AI or collision
 - **Monster AI** — all 15 Quake monster types animate, alert on line-of-sight, chase, and melee attack; blocked by closed doors; subject to gravity
 - **Blood particles** — axe hits spray ~80 physics-simulated particles in a wide cone; particles arc with gravity, splat on walls and floors, then fade out
+- **Wall sparks** — hitscan rounds striking BSP geometry spray 12 orange spark particles per pellet; sparks arc under gravity and fade as stuck decals
+- **Bullet tracers** — each hitscan pellet leaves a brief bright yellow-white line from the weapon muzzle to the impact point; pool of 128, 50 ms lifetime, additively blended
 - **Combat** — left-click attacks with the active weapon: axe (melee swing, hit at frame 2), shotgun/super shotgun (hitscan pellets with spread), nailgun/super nailgun (full-auto hitscan), rocket/grenade launcher, lightning gun; weapons switched with keys 1–8
 - **Player health** — starts at 100 HP; monsters deal 10 damage per hit; health bar at screen bottom; death teleports back to spawn
 - **Respawn** — on death the player resets to spawn, HP restores to 100, and all monsters un-alert

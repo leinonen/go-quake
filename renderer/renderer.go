@@ -156,12 +156,19 @@ type Renderer struct {
 	underwaterVAO     uint32
 	underwaterTimeLoc int32
 
-	// blood particles
+	// blood particles and sparks
 	particleProg    uint32
 	particleVAO     uint32
 	particleVBO     uint32
 	partMVPLoc      int32
 	particleScratch []float32 // reused each frame
+
+	// bullet tracers
+	tracerProg    uint32
+	tracerVAO     uint32
+	tracerVBO     uint32
+	tracerMVPLoc  int32
+	tracerScratch []float32
 
 	startTime  time.Time
 	entityVAOs []entityRenderable
@@ -200,7 +207,8 @@ func Init(m *bsp.Map,
 	weapVertSrc, weapFragSrc,
 	hudVertSrc, hudFragSrc,
 	partVertSrc, partFragSrc,
-	uwVertSrc, uwFragSrc string,
+	uwVertSrc, uwFragSrc,
+	tracerVertSrc, tracerFragSrc string,
 	palette []byte,
 	weapons []WeaponModel,
 	items []ItemModel,
@@ -464,7 +472,7 @@ func Init(m *bsp.Map,
 	gl.VertexAttribPointerWithOffset(1, 2, gl.FLOAT, false, 16, 8)
 	gl.BindVertexArray(0)
 
-	// Particle shader + dynamic VBO (512 particles × 5 floats × 4 bytes)
+	// Particle shader + dynamic VBO (2048 particles × 6 floats × 4 bytes)
 	if len(partVertSrc) > 0 && len(partFragSrc) > 0 {
 		pp, err := compileRender(partVertSrc, partFragSrc)
 		if err != nil {
@@ -477,20 +485,48 @@ func Init(m *bsp.Map,
 		gl.BindVertexArray(r.particleVAO)
 		gl.GenBuffers(1, &r.particleVBO)
 		gl.BindBuffer(gl.ARRAY_BUFFER, r.particleVBO)
-		gl.BufferData(gl.ARRAY_BUFFER, 2048*5*4, nil, gl.DYNAMIC_DRAW)
-		// aPos: 3 floats at offset 0
+		gl.BufferData(gl.ARRAY_BUFFER, 2048*6*4, nil, gl.DYNAMIC_DRAW)
+		// aPos: 3 floats at offset 0, stride 24
 		gl.EnableVertexAttribArray(0)
-		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 20, 0)
+		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 24, 0)
 		// aLife: 1 float at offset 12
 		gl.EnableVertexAttribArray(1)
-		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 20, 12)
+		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 24, 12)
 		// aStuck: 1 float at offset 16
 		gl.EnableVertexAttribArray(2)
-		gl.VertexAttribPointerWithOffset(2, 1, gl.FLOAT, false, 20, 16)
+		gl.VertexAttribPointerWithOffset(2, 1, gl.FLOAT, false, 24, 16)
+		// aKind: 1 float at offset 20
+		gl.EnableVertexAttribArray(3)
+		gl.VertexAttribPointerWithOffset(3, 1, gl.FLOAT, false, 24, 20)
 		gl.BindVertexArray(0)
 
 		gl.Enable(gl.PROGRAM_POINT_SIZE)
-		r.particleScratch = make([]float32, 0, 2048*5)
+		r.particleScratch = make([]float32, 0, 2048*6)
+	}
+
+	// Tracer shader + dynamic VBO (128 tracers × 2 vertices × 4 floats × 4 bytes)
+	if len(tracerVertSrc) > 0 && len(tracerFragSrc) > 0 {
+		tp, err := compileRender(tracerVertSrc, tracerFragSrc)
+		if err != nil {
+			return nil, fmt.Errorf("compile tracer shaders: %w", err)
+		}
+		r.tracerProg = tp
+		r.tracerMVPLoc = gl.GetUniformLocation(tp, gl.Str("uMVP\x00"))
+
+		gl.GenVertexArrays(1, &r.tracerVAO)
+		gl.BindVertexArray(r.tracerVAO)
+		gl.GenBuffers(1, &r.tracerVBO)
+		gl.BindBuffer(gl.ARRAY_BUFFER, r.tracerVBO)
+		gl.BufferData(gl.ARRAY_BUFFER, 128*2*4*4, nil, gl.DYNAMIC_DRAW)
+		// aPos: 3 floats at offset 0, stride 16
+		gl.EnableVertexAttribArray(0)
+		gl.VertexAttribPointerWithOffset(0, 3, gl.FLOAT, false, 16, 0)
+		// aLife: 1 float at offset 12
+		gl.EnableVertexAttribArray(1)
+		gl.VertexAttribPointerWithOffset(1, 1, gl.FLOAT, false, 16, 12)
+		gl.BindVertexArray(0)
+
+		r.tracerScratch = make([]float32, 0, 128*8)
 	}
 
 	// Underwater tint overlay — fullscreen quad shader
@@ -642,7 +678,7 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 		gl.Enable(gl.CULL_FACE)
 	}
 
-	// Draw blood particles — alpha blended, depth write off.
+	// Draw particles (blood + sparks) — alpha blended, depth write off.
 	if r.particleProg != 0 && len(p.Particles) > 0 {
 		r.particleScratch = r.particleScratch[:0]
 		for _, pt := range p.Particles {
@@ -650,11 +686,11 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 			if pt.Stuck {
 				stuck = 1
 			}
-			r.particleScratch = append(r.particleScratch, pt.Pos[0], pt.Pos[1], pt.Pos[2], pt.Life, stuck)
+			r.particleScratch = append(r.particleScratch, pt.Pos[0], pt.Pos[1], pt.Pos[2], pt.Life, stuck, float32(pt.Kind))
 		}
 		n := int32(len(p.Particles))
 		gl.BindBuffer(gl.ARRAY_BUFFER, r.particleVBO)
-		gl.BufferSubData(gl.ARRAY_BUFFER, 0, int(n)*20, unsafe.Pointer(&r.particleScratch[0]))
+		gl.BufferSubData(gl.ARRAY_BUFFER, 0, int(n)*24, unsafe.Pointer(&r.particleScratch[0]))
 		gl.BindBuffer(gl.ARRAY_BUFFER, 0)
 
 		gl.Enable(gl.BLEND)
@@ -666,6 +702,36 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 		gl.UniformMatrix4fv(r.partMVPLoc, 1, false, &mvp[0])
 		gl.BindVertexArray(r.particleVAO)
 		gl.DrawArrays(gl.POINTS, 0, n)
+		gl.BindVertexArray(0)
+
+		gl.DepthMask(true)
+		gl.Disable(gl.BLEND)
+		gl.Enable(gl.CULL_FACE)
+	}
+
+	// Draw bullet tracers — alpha blended lines, depth write off.
+	if r.tracerProg != 0 && len(p.Tracers) > 0 {
+		r.tracerScratch = r.tracerScratch[:0]
+		for _, tr := range p.Tracers {
+			r.tracerScratch = append(r.tracerScratch,
+				tr.From[0], tr.From[1], tr.From[2], tr.Life,
+				tr.To[0], tr.To[1], tr.To[2], tr.Life,
+			)
+		}
+		n := int32(len(p.Tracers) * 2)
+		gl.BindBuffer(gl.ARRAY_BUFFER, r.tracerVBO)
+		gl.BufferSubData(gl.ARRAY_BUFFER, 0, int(n)*16, unsafe.Pointer(&r.tracerScratch[0]))
+		gl.BindBuffer(gl.ARRAY_BUFFER, 0)
+
+		gl.Enable(gl.BLEND)
+		gl.BlendFunc(gl.SRC_ALPHA, gl.ONE)
+		gl.DepthMask(false)
+		gl.Disable(gl.CULL_FACE)
+
+		gl.UseProgram(r.tracerProg)
+		gl.UniformMatrix4fv(r.tracerMVPLoc, 1, false, &mvp[0])
+		gl.BindVertexArray(r.tracerVAO)
+		gl.DrawArrays(gl.LINES, 0, n)
 		gl.BindVertexArray(0)
 
 		gl.DepthMask(true)

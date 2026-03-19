@@ -69,6 +69,12 @@ var uwVertSrc string
 //go:embed renderer/shaders/underwater.frag.glsl
 var uwFragSrc string
 
+//go:embed renderer/shaders/tracer.vert.glsl
+var tracerVertSrc string
+
+//go:embed renderer/shaders/tracer.frag.glsl
+var tracerFragSrc string
+
 const eyeHeight = 22.0
 
 func main() {
@@ -325,6 +331,7 @@ func main() {
 		hudVertSrc, hudFragSrc,
 		partVertSrc, partFragSrc,
 		uwVertSrc, uwFragSrc,
+		tracerVertSrc, tracerFragSrc,
 		palette, allWeaponModels[:], itemModels, hudAssets)
 	if err != nil {
 		log.Fatalf("renderer init: %v", err)

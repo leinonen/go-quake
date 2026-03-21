@@ -27,6 +27,7 @@ type Map struct {
 	MipTexes     []MipTex   // indexed by MipTex field of DTexInfo
 	Entities     string     // raw entity lump text
 	ClipNodes    []DClipNode
+	Hull0        []DClipNode // point hull built from rendering nodes at load time
 }
 
 // Load parses a BSP29 file from disk path.
@@ -215,6 +216,26 @@ func parse(f interface {
 				copy(mt.Pixels, raw[pixStart:pixStart+pixSize])
 			}
 			m.MipTexes[i] = mt
+		}
+	}
+
+	// Build hull 0 (point hull) from BSP rendering nodes, mirroring Quake's Mod_MakeHull0.
+	// BSP node children encode leaf indices as -(leafIdx+1); convert to leaf Contents values.
+	m.Hull0 = make([]DClipNode, len(m.Nodes))
+	for i, n := range m.Nodes {
+		m.Hull0[i].PlaneNum = n.PlaneNum
+		for j := 0; j < 2; j++ {
+			child := int(n.Children[j])
+			if child >= 0 {
+				m.Hull0[i].Children[j] = n.Children[j]
+			} else {
+				leafIdx := -(child + 1)
+				if leafIdx < len(m.Leaves) {
+					m.Hull0[i].Children[j] = int16(m.Leaves[leafIdx].Contents)
+				} else {
+					m.Hull0[i].Children[j] = int16(ContentsEmpty)
+				}
+			}
 		}
 	}
 

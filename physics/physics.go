@@ -690,8 +690,6 @@ func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
 	const rayLen = 2048.0
 	const hitRadius = 40.0
 
-	pointHull := p.m.Models[0].HeadNodes[0]
-
 	for pellet := 0; pellet < numPellets; pellet++ {
 		dx, dy, dz := baseFwdX, baseFwdY, baseFwdZ
 		if spreadFactor > 0 && numPellets > 1 {
@@ -748,7 +746,7 @@ func fireHitscan(p *Physics, numPellets int, spreadFactor float32, damage int) {
 			eyePos[1] + dy*hitT,
 			eyePos[2] + dz*hitT,
 		}
-		tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, eyePos, endPos)
+		tr := bsp.HullTrace(p.m.Hull0, p.m.Planes, p.m.Models[0].HeadNodes[0], eyePos, endPos)
 
 		var hitPoint [3]float32
 		if tr.Hit {
@@ -822,7 +820,7 @@ func tryAxeHit(p *Physics) {
 
 // tickMonsters advances monster AI, animation, gravity and collision for one tick.
 func tickMonsters(p *Physics, dt float32) {
-	if len(p.m.ClipNodes) == 0 || len(p.m.Models) == 0 {
+	if len(p.m.Hull0) == 0 || len(p.m.Models) == 0 {
 		return
 	}
 
@@ -831,7 +829,6 @@ func tickMonsters(p *Physics, dt float32) {
 		p.Pos[1],
 		p.Pos[2] - eyeHeight,
 	}
-	pointHull := p.m.Models[0].HeadNodes[0]
 
 	for i := range p.monsters {
 		mn := &p.monsters[i]
@@ -917,7 +914,7 @@ func tickMonsters(p *Physics, dt float32) {
 
 		// Alert check: LOS trace from monster to player (world only)
 		if !mn.Alerted && dist < 1024 {
-			tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, mn.Pos, playerFoot)
+			tr := bsp.HullTrace(p.m.Hull0, p.m.Planes, p.m.Models[0].HeadNodes[0], mn.Pos, playerFoot)
 			if !tr.Hit {
 				mn.Alerted = true
 			}
@@ -1126,10 +1123,9 @@ func tickFlames(p *Physics, dt float32) {
 
 // tickParticles advances all active particles for one physics tick.
 func tickParticles(p *Physics, dt float32) {
-	if len(p.m.ClipNodes) == 0 || len(p.m.Models) == 0 {
+	if len(p.m.Hull0) == 0 || len(p.m.Models) == 0 {
 		return
 	}
-	pointHull := p.m.Models[0].HeadNodes[0]
 	for i := range p.particles {
 		pt := &p.particles[i]
 		if !pt.Active {
@@ -1154,7 +1150,7 @@ func tickParticles(p *Physics, dt float32) {
 		if pt.Kind == particleKindSpark {
 			stuckLife = sparkStuckLife
 		}
-		tr := bsp.HullTrace(p.m.ClipNodes, p.m.Planes, pointHull, pt.Pos, end)
+		tr := bsp.HullTrace(p.m.Hull0, p.m.Planes, p.m.Models[0].HeadNodes[0], pt.Pos, end)
 		if tr.StartSolid {
 			pt.Stuck = true
 			if pt.Life > stuckLife {
@@ -1199,8 +1195,7 @@ func buildParticleItems(p *Physics) {
 
 // monsterMoveTrace traces a point through world + brush entities using the point hull.
 func monsterMoveTrace(m *bsp.Map, brushEnts []*entities.BrushEntity, start, end [3]float32) bsp.TraceResult {
-	pointHull := m.Models[0].HeadNodes[0]
-	best := bsp.HullTrace(m.ClipNodes, m.Planes, pointHull, start, end)
+	best := bsp.HullTrace(m.ClipNodes, m.Planes, m.Models[0].HeadNodes[0], start, end)
 	for _, ent := range brushEnts {
 		entModel := m.Models[ent.ModelIndex]
 		entHull := entModel.HeadNodes[1]

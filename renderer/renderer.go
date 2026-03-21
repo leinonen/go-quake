@@ -170,7 +170,10 @@ type Renderer struct {
 	tracerMVPLoc  int32
 	tracerScratch []float32
 
-	startTime  time.Time
+	startTime    time.Time
+	bobPhase     float32
+	lastDrawTime time.Time
+	smoothedRoll float32
 	entityVAOs []entityRenderable
 	itemVAOs   []itemRenderable
 }
@@ -576,14 +579,56 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 	yaw := mgl32.DegToRad(p.Yaw)
 	pitch := mgl32.DegToRad(p.Pitch)
 
+	// Per-frame dt for bob accumulation
+	now := time.Now()
+	dt := float32(now.Sub(r.lastDrawTime).Seconds())
+	if r.lastDrawTime.IsZero() || dt > 0.1 {
+		dt = 0
+	}
+	r.lastDrawTime = now
+
+	// Horizontal speed (XY only)
+	hspeed := float32(math.Sqrt(float64(p.Velocity[0]*p.Velocity[0] + p.Velocity[1]*p.Velocity[1])))
+
+	// Advance bob phase only when moving on ground
+	if p.OnGround && hspeed > 10 {
+		r.bobPhase += dt * hspeed / 320.0
+	}
+
+	// Normalised amplitude 0..1 based on speed
+	bobAmp := hspeed / 320.0
+
+	// Bob offsets (vertical at 2× frequency of horizontal)
+	bobV := float32(math.Sin(float64(r.bobPhase*math.Pi*2))) * bobAmp * 2.0 // ±2 units vertical
+	bobH := float32(math.Sin(float64(r.bobPhase*math.Pi))) * bobAmp * 1.0   // ±1 unit horizontal
+
 	// Forward vector from yaw+pitch
 	forward := mgl32.Vec3{
 		float32(math.Cos(float64(pitch)) * math.Cos(float64(yaw))),
 		float32(math.Cos(float64(pitch)) * math.Sin(float64(yaw))),
 		float32(math.Sin(float64(pitch))),
 	}
+
+	// Right vector from yaw (Quake XY plane)
+	right := mgl32.Vec3{float32(math.Sin(float64(yaw))), -float32(math.Cos(float64(yaw))), 0}
+
+	// Apply bob to eye position
+	pos = pos.Add(right.Mul(bobH))
+	pos[2] += bobV
+
 	target := pos.Add(forward)
 	up := mgl32.Vec3{0, 0, 1}
+
+	// Roll: tilt camera based on sideways velocity (max ~4 degrees), smoothed
+	sideVel := p.Velocity[0]*right[0] + p.Velocity[1]*right[1]
+	maxRoll := float32(4.0 * math.Pi / 180.0)
+	targetRoll := sideVel / 320.0 * maxRoll // strafe right → tilt right
+	rollSpeed := float32(8.0)               // higher = snappier, lower = more lag
+	if dt > 0 {
+		r.smoothedRoll += (targetRoll - r.smoothedRoll) * (1 - float32(math.Exp(float64(-rollSpeed*dt))))
+	}
+	up = up.Add(right.Mul(r.smoothedRoll)).Normalize()
+
 	view := mgl32.LookAtV(pos, target, up)
 	mvp := proj.Mul4(view)
 
@@ -761,8 +806,14 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 				rotZ := mgl32.HomogRotate3DZ(mgl32.DegToRad(90))
 				rotX := mgl32.HomogRotate3DX(mgl32.DegToRad(-90))
 				rot := rotX.Mul4(rotZ)
-				trans := mgl32.Translate3D(0, -10, -10)
-				weaponMat := trans.Mul4(rot)
+
+				// Weapon bob in camera space — slightly larger amplitude than view bob
+				weapBobV := bobV * 1.5
+				weapBobH := bobH * 1.2
+				weapRoll := r.smoothedRoll * 0.75 // slightly less tilt than camera roll
+				trans := mgl32.Translate3D(weapBobH, -10+weapBobV, -10)
+				rollMat := mgl32.HomogRotate3DZ(weapRoll)
+				weaponMat := trans.Mul4(rollMat).Mul4(rot)
 
 				gl.UseProgram(r.weaponProg)
 				gl.UniformMatrix4fv(r.weapProjLoc, 1, false, &proj[0])

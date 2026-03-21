@@ -987,77 +987,79 @@ func tickMonsters(p *Physics, dt float32) {
 	}
 }
 
+// allocParticle returns the index of a free particle slot.
+// If none is available, it evicts the stuck particle with the lowest remaining life.
+func allocParticle(p *Physics) int {
+	for range p.particles {
+		i := p.nextFreeHint % particleCount
+		p.nextFreeHint++
+		if !p.particles[i].Active {
+			return i
+		}
+	}
+	// Pool full — evict the stuck decal with the least life remaining.
+	best := -1
+	var bestLife float32 = 1e9
+	for i := range p.particles {
+		if p.particles[i].Stuck && p.particles[i].Life < bestLife {
+			bestLife = p.particles[i].Life
+			best = i
+		}
+	}
+	return best // -1 if every particle is flying (very unlikely)
+}
+
 // emitBloodParticles sprays blood from origin toward the hit direction.
 func emitBloodParticles(p *Physics, origin [3]float32, fwdX, fwdY, fwdZ float32) {
-	emitted := 0
-	for emitted < particleEmitCount {
-		found := false
-		for range p.particles {
-			i := p.nextFreeHint % particleCount
-			p.nextFreeHint++
-			if !p.particles[i].Active {
-				lx := fwdX + (rand.Float32()*2-1)*particleSpread
-				ly := fwdY + (rand.Float32()*2-1)*particleSpread
-				lz := fwdZ + (rand.Float32()*2-1)*particleSpread
-				mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
-				if mag < 1e-6 {
-					mag = 1
-				}
-				speed := particleSpeed * (0.5 + rand.Float32()*0.5)
-				p.particles[i] = particle{
-					Pos:     origin,
-					Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
-					Life:    particleFlyLife,
-					MaxLife: particleFlyLife,
-					Active:  true,
-					Stuck:   false,
-					Kind:    particleKindBlood,
-				}
-				found = true
-				break
-			}
+	for emitted := 0; emitted < particleEmitCount; emitted++ {
+		i := allocParticle(p)
+		if i < 0 {
+			break
 		}
-		if !found {
-			break // pool exhausted
+		lx := fwdX + (rand.Float32()*2-1)*particleSpread
+		ly := fwdY + (rand.Float32()*2-1)*particleSpread
+		lz := fwdZ + (rand.Float32()*2-1)*particleSpread
+		mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
+		if mag < 1e-6 {
+			mag = 1
 		}
-		emitted++
+		speed := particleSpeed * (0.5 + rand.Float32()*0.5)
+		p.particles[i] = particle{
+			Pos:     origin,
+			Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
+			Life:    particleFlyLife,
+			MaxLife: particleFlyLife,
+			Active:  true,
+			Stuck:   false,
+			Kind:    particleKindBlood,
+		}
 	}
 }
 
 // emitWallSparks sprays spark particles from a wall impact point in the hemisphere around the surface normal.
 func emitWallSparks(p *Physics, origin [3]float32, nx, ny, nz float32) {
-	emitted := 0
-	for emitted < sparkEmitCount {
-		found := false
-		for range p.particles {
-			i := p.nextFreeHint % particleCount
-			p.nextFreeHint++
-			if !p.particles[i].Active {
-				lx := nx + (rand.Float32()*2-1)*sparkSpread
-				ly := ny + (rand.Float32()*2-1)*sparkSpread
-				lz := nz + (rand.Float32()*2-1)*sparkSpread
-				mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
-				if mag < 1e-6 {
-					mag = 1
-				}
-				speed := sparkSpeed * (0.5 + rand.Float32()*0.5)
-				p.particles[i] = particle{
-					Pos:     origin,
-					Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
-					Life:    sparkFlyLife,
-					MaxLife: sparkFlyLife,
-					Active:  true,
-					Stuck:   false,
-					Kind:    particleKindSpark,
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
+	for emitted := 0; emitted < sparkEmitCount; emitted++ {
+		i := allocParticle(p)
+		if i < 0 {
 			break
 		}
-		emitted++
+		lx := nx + (rand.Float32()*2-1)*sparkSpread
+		ly := ny + (rand.Float32()*2-1)*sparkSpread
+		lz := nz + (rand.Float32()*2-1)*sparkSpread
+		mag := float32(math.Sqrt(float64(lx*lx + ly*ly + lz*lz)))
+		if mag < 1e-6 {
+			mag = 1
+		}
+		speed := sparkSpeed * (0.5 + rand.Float32()*0.5)
+		p.particles[i] = particle{
+			Pos:     origin,
+			Vel:     [3]float32{lx / mag * speed, ly / mag * speed, lz / mag * speed},
+			Life:    sparkFlyLife,
+			MaxLife: sparkFlyLife,
+			Active:  true,
+			Stuck:   false,
+			Kind:    particleKindSpark,
+		}
 	}
 }
 

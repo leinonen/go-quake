@@ -14,6 +14,7 @@ import (
 const (
 	mouseSens      = 0.15
 	moveSpeed      = 320.0 // units/s, classic Quake speed
+	itemRotSpeed   = 1.8   // radians/s — world item spin rate
 	eyeHeight      = 22.0  // view height above player origin (Quake DEFAULT_VIEWHEIGHT)
 	gravity        = 800.0 // units/s^2
 	jumpSpeed      = 270.0 // initial Z velocity on jump
@@ -93,16 +94,18 @@ type inputSnapshot struct {
 // Physics holds all mutable physics state and is queried each frame by the renderer.
 type Physics struct {
 	// Exported — read by renderer each frame
-	Pos        mgl32.Vec3
-	Velocity   mgl32.Vec3
-	Yaw, Pitch float32
-	LeafIndex  int
-	OnGround   bool
-	Health     int
-	WeaponFrame int
-	Weapon     int   // active weapon slot (0=axe, 1=shotgun, ...)
-	Ammo       [8]int
-	InWater    bool
+	Pos             mgl32.Vec3
+	Velocity        mgl32.Vec3
+	Yaw, Pitch      float32
+	LeafIndex       int
+	OnGround        bool
+	Health          int
+	Armor           int     // current armor points
+	ArmorAbsorption float32 // fraction of damage absorbed by armor
+	WeaponFrame     int
+	Weapon          int // active weapon slot (0=axe, 1=shotgun, ...)
+	Ammo            [8]int
+	InWater         bool
 	Entities   []entities.EntityState
 	Particles  []ParticleState
 	Tracers    []TracerState
@@ -141,6 +144,7 @@ type Physics struct {
 	// private item data
 	itemSpawns []entities.ItemSpawn
 	initItems  []ItemState
+	itemYaws   []float32 // per-item rotation angle, advanced each tick
 	picked     []bool
 
 	// private BSP/entity refs
@@ -170,6 +174,7 @@ func New(win *glfw.Window, m *bsp.Map, mgr *entities.Manager, spawn mgl32.Vec3,
 		flames:            flames,
 		itemSpawns:        itemSpawns,
 		initItems:         initItems,
+		itemYaws:          make([]float32, len(itemSpawns)),
 		picked:            make([]bool, len(itemSpawns)),
 		m:                 m,
 		mgr:               mgr,
@@ -286,6 +291,7 @@ func (p *Physics) Tick(dt float32) {
 	tickParticles(p, dt)
 	tickTracers(p, dt)
 	tickFlames(p, dt)
+	tickItemYaws(p, dt)
 
 	// Check item pickups against player foot origin.
 	foot := [3]float32{p.Pos[0], p.Pos[1], p.Pos[2] - eyeHeight}
@@ -330,6 +336,10 @@ func (p *Physics) Tick(dt float32) {
 					p.Ammo[item.AmmoType] = ammoCaps[item.AmmoType]
 				}
 			}
+			if item.ArmorValue > 0 {
+				p.Armor = item.ArmorValue
+				p.ArmorAbsorption = item.ArmorAbsorption
+			}
 		}
 	}
 
@@ -339,6 +349,8 @@ func (p *Physics) Tick(dt float32) {
 		p.Velocity = mgl32.Vec3{}
 		p.OnGround = false
 		p.Health = 100
+		p.Armor = 0
+		p.ArmorAbsorption = 0
 		p.LeafIndex = bsp.LeafForPoint(p.m, [3]float32(p.Pos))
 		p.InWater = p.LeafIndex < len(p.m.Leaves) && p.m.Leaves[p.LeafIndex].Contents == bsp.ContentsWater
 		for i := range p.monsters {
@@ -356,6 +368,7 @@ func (p *Physics) buildItems() {
 	p.Items = p.Items[:0]
 	for i, it := range p.initItems {
 		if !p.picked[i] {
+			it.Yaw = p.itemYaws[i]
 			p.Items = append(p.Items, it)
 		}
 	}
@@ -981,8 +994,33 @@ func tickMonsters(p *Physics, dt float32) {
 		// Melee attack
 		mn.AttackCooldown -= dt
 		if mn.Alerted && dist < entities.MonsterMeleeDist && mn.AttackCooldown <= 0 {
-			p.Health -= entities.MonsterDamage
+			applyDamage(p, entities.MonsterDamage)
 			mn.AttackCooldown = entities.MonsterAttackCooldown
+		}
+	}
+}
+
+// applyDamage applies raw damage to the player, absorbing a portion via armor first.
+func applyDamage(p *Physics, damage int) {
+	if p.Armor > 0 && p.ArmorAbsorption > 0 {
+		absorbed := int(float32(damage) * p.ArmorAbsorption)
+		if absorbed > p.Armor {
+			absorbed = p.Armor
+		}
+		p.Armor -= absorbed
+		if p.Armor == 0 {
+			p.ArmorAbsorption = 0
+		}
+		damage -= absorbed
+	}
+	p.Health -= damage
+}
+
+// tickItemYaws advances per-item rotation angles for items that rotate (weapons and armor).
+func tickItemYaws(p *Physics, dt float32) {
+	for i := range p.itemYaws {
+		if !p.picked[i] && p.itemSpawns[i].Rotates {
+			p.itemYaws[i] += itemRotSpeed * dt
 		}
 	}
 }

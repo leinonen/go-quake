@@ -29,12 +29,15 @@ const (
 
 // ItemSpawn holds the world position and model path (.mdl or .bsp) for one item entity.
 type ItemSpawn struct {
-	Pos         [3]float32
-	ModelPath   string
-	HealthValue int // >0 for health packs; amount of HP restored on pickup
-	WeaponType  int // WeaponNone or WeaponShotgun..WeaponLightning
-	AmmoType    int // AmmoNone or AmmoShells..AmmoCells
-	AmmoAmount  int // amount granted on pickup
+	Pos              [3]float32
+	ModelPath        string
+	HealthValue      int     // >0 for health packs; amount of HP restored on pickup
+	WeaponType       int     // WeaponNone or WeaponShotgun..WeaponLightning
+	AmmoType         int     // AmmoNone or AmmoShells..AmmoCells
+	AmmoAmount       int     // amount granted on pickup
+	ArmorValue       int     // >0 for armor items; total armor points granted
+	ArmorAbsorption  float32 // fraction of incoming damage absorbed by armor (0.3/0.6/0.8)
+	Rotates          bool    // true for weapons and armor (spin in place); false for health/ammo
 }
 
 // ParseItems returns all item spawns from a BSP entity lump.
@@ -112,13 +115,32 @@ func ParseItems(entityLump string) []ItemSpawn {
 			}
 		}
 
+		armorValue := 0
+		var armorAbsorption float32
+		switch e.Fields["classname"] {
+		case "item_armor1":
+			armorValue = 100
+			armorAbsorption = 0.3
+		case "item_armor2":
+			armorValue = 150
+			armorAbsorption = 0.6
+		case "item_armorInv":
+			armorValue = 200
+			armorAbsorption = 0.8
+		}
+
+		rotates := weaponType != WeaponNone || armorValue > 0
+
 		out = append(out, ItemSpawn{
-			Pos:         pos,
-			ModelPath:   path,
-			HealthValue: health,
-			WeaponType:  weaponType,
-			AmmoType:    ammoType,
-			AmmoAmount:  ammoAmount,
+			Pos:             pos,
+			ModelPath:       path,
+			HealthValue:     health,
+			WeaponType:      weaponType,
+			AmmoType:        ammoType,
+			AmmoAmount:      ammoAmount,
+			ArmorValue:      armorValue,
+			ArmorAbsorption: armorAbsorption,
+			Rotates:         rotates,
 		})
 	}
 	return out

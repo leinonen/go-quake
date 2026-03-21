@@ -202,9 +202,22 @@ Item spawns (weapons, armor, ammo, health, keys) are loaded from the BSP entity 
 **Pickup detection** runs in the physics goroutine:
 - After each movement tick, the player foot origin (`position − eyeHeight`) is checked against each unpicked item
 - Radius: 32 units (Quake standard)
-- On contact: if `item.HealthValue > 0` the player's HP is increased (capped at 100); index sent on `bus.ItemPickups` (non-blocking); `picked[i] = true` prevents double-pickup
+- On contact: `picked[i] = true` prevents double-pickup; appropriate effect applied by item type
 
-**Main loop** drains `bus.ItemPickups` each frame, marks `pickedItems[idx] = true`, then builds `visibleItems` from unpicked items plus `playerState.MonsterItems`.
+**Item effects on pickup:**
+- Health (`HealthValue > 0`): HP += value, capped at 100
+- Weapon: grant weapon + ammo, switch to it
+- Ammo: add to ammo pool, capped per type
+- Armor (`ArmorValue > 0`): `p.Armor = item.ArmorValue`, `p.ArmorAbsorption = item.ArmorAbsorption`
+
+**Armor types** (from `entities/items.go`):
+- `item_armor1` (green): 100 AP, 0.3 absorption
+- `item_armor2` (yellow): 150 AP, 0.6 absorption
+- `item_armorInv` (red): 200 AP, 0.8 absorption
+
+**Damage application** (`applyDamage` in physics): absorbs `floor(damage × ArmorAbsorption)` from armor first (capped at current armor points), remainder deducted from HP. Armor depleted to 0 clears `ArmorAbsorption`.
+
+**Item rotation**: `tickItemYaws` advances `itemYaws[i] += itemRotSpeed × dt` (1.8 rad/s) for all unpicked items each tick. `buildItems` copies `itemYaws[i]` into each `ItemState.Yaw`, which the renderer applies as a Z-axis rotation via `HomogRotate3DZ`.
 
 **Single-player rules**: no item respawn. Items are gone permanently once picked.
 
@@ -221,17 +234,21 @@ Monster state lives entirely in `entities.MonsterState` slices owned by the phys
 
 Live monsters are communicated to the renderer each frame as `PlayerState.MonsterItems []ItemState`, where each entry carries `Pos`, `MdlIdx`, and `Frame`. The renderer indexes into `itemVAOs[MdlIdx].frames[Frame]` to draw the correct animation frame.
 
-## player health and respawn
+## player health, armor, and respawn
 
-- Player starts at 100 HP
+- Player starts at 100 HP, 0 armor
 - Health packs restore 25 HP (normal) or 100 HP (megahealth), capped at 100
-- Monster melee deals 10 HP per hit
-- `PlayerState.Health` is published each physics tick; the HUD bar reads it
-- On death (`playerHP ≤ 0`): player teleports to spawn, velocity zeroed, HP reset to 100, all monsters un-alert
+- Monster melee calls `applyDamage`: armor absorbs its fraction first, remainder hits HP
+- `PlayerState.Health` and `PlayerState.Armor` published each physics tick
+- On death (`Health ≤ 0`): teleport to spawn, velocity zeroed, HP reset to 100, Armor/ArmorAbsorption reset to 0, all monsters un-alert
 
-## HUD health bar
+## HUD bars
 
-Drawn last (after weapon), depth test disabled. A static NDC quad covers the bottom strip of the screen (`y ∈ [−1, −0.97]`). The fragment shader discards pixels where `vUV.x > uFrac` where `uFrac = Health / 100.0`. Colour transitions from green (full health) to red (low health) as `uFrac` decreases.
+Drawn last (after weapon), depth test disabled. Three NDC quads cover the bottom strip (`y ∈ [−1, −0.97]`). The gradient shader (`hudGradFragSrc`) takes `uFrac` (filled fraction) and `uKind` (bar type):
+
+- **Health** (`uKind=0`): x ∈ [−1, −0.34]; green→red gradient based on `uFrac = Health / 100`
+- **Armor** (`uKind=1`): x ∈ [−0.33, 0.33]; gold colour; only drawn when `Armor > 0`; `uFrac = Armor / 200`
+- **Ammo** (`uKind=2`): x ∈ [0.34, 1]; blue colour; `uFrac = currentAmmo / maxAmmo`
 
 ## multi-frame MDL rendering
 
@@ -247,10 +264,11 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics; screen-space blue-green tint when submerged.
 - View weapon: `v_axe.mdl` rendered in camera space with full swing animation and hit detection; hitscan weapons (shotgun through lightning gun) share the same firing input and auto-switch on empty ammo.
 - View bob and camera roll: camera bobs vertically (±2 units) and horizontally (±1 unit) when moving on ground, speed-scaled; camera tilts up to 4° when strafing via smoothed exponential decay; weapon position and roll track the view bob at slightly larger amplitude.
-- Item pickup: weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP.
+- Item pickup: weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP; armor items set armor points + absorption fraction; `applyDamage` routes damage through armor before health.
+- Item rotation: world items (weapons, armor) spin at 1.8 rad/s around Z via per-item `itemYaws[]` advanced each tick.
 - Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.
 - Player respawn: death teleports back to spawn with full HP and reset monster alert state.
-- HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
+- HUD bars: three NDC quads at screen bottom — health (green→red, left third), armor (gold, center third, only when armor > 0), ammo (blue, right third); `uKind` uniform selects colour mode.
 - Blood particles: axe and bullet hits spray 150 physics-simulated GL_POINTS in a wide cone; pool of 2048 shared with sparks; `allocParticle` evicts the lowest-life stuck decal when the pool is full so new hits always emit; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
 - Wall sparks: hitscan pellets that strike BSP geometry emit 12 orange spark particles (`particleKindSpark`) per pellet; share the 2048-slot particle pool with blood; stuck decals fade in 2s; fragment shader branches on `vKind` for colour (orange→grey vs red).
 - Bullet tracers: each hitscan pellet emits a `tracer` line segment from the weapon muzzle (`muzzlePos`: eye + forward×10 − up×10) to the impact point; pool of 128; lifetime 50 ms; exported as `[]TracerState` (normalised life); rendered as `GL_LINES` with additive blending (`GL_ONE`) in `tracer.vert/frag.glsl`.

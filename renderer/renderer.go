@@ -29,16 +29,24 @@ type HUDAssets struct {
 // hudSprite stores normalised atlas UV coordinates and pixel size for one sprite.
 type hudSprite struct{ u0, v0, u1, v1, pw, ph float32 }
 
-// hudGradFragSrc is the fallback gradient health-bar shader used when no HUD assets are available.
+// hudGradFragSrc is the fallback gradient bar shader.
+// uKind: 0=health (green→red gradient), 1=armor (gold), 2=ammo (blue)
 const hudGradFragSrc = `#version 430 core
 uniform float uFrac;
+uniform int   uKind;
 in vec2 vUV;
 out vec4 FragColor;
 void main() {
     if (vUV.x > uFrac) discard;
-    float r = 1.0 - uFrac;
-    float g = uFrac;
-    FragColor = vec4(r, g, 0.1, 1.0);
+    if (uKind == 1) {
+        FragColor = vec4(0.9, 0.7, 0.1, 1.0);
+    } else if (uKind == 2) {
+        FragColor = vec4(0.2, 0.5, 1.0, 1.0);
+    } else {
+        float r = 1.0 - uFrac;
+        float g = uFrac;
+        FragColor = vec4(r, g, 0.1, 1.0);
+    }
 }
 `
 
@@ -131,6 +139,7 @@ type Renderer struct {
 	// HUD — gradient fallback (always available)
 	hudGradProg uint32
 	hudFracLoc  int32
+	hudKindLoc  int32
 
 	// HUD — sprite atlas (used when HUDAssets were provided)
 	hudProg     uint32
@@ -449,6 +458,7 @@ func Init(m *bsp.Map,
 		}
 		r.hudGradProg = gp
 		r.hudFracLoc = gl.GetUniformLocation(gp, gl.Str("uFrac\x00"))
+		r.hudKindLoc = gl.GetUniformLocation(gp, gl.Str("uKind\x00"))
 	}
 
 	// HUD — compile atlas shader and build sprite atlas when assets are provided.
@@ -872,31 +882,46 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 				gl.BindTexture(gl.TEXTURE_2D, 0)
 			}
 		} else if r.hudGradProg != 0 {
-			// Gradient fallback path: health bar (left half) + ammo bar (right half).
+			// Gradient fallback path: health (left third) | armor (middle third) | ammo (right third).
 			gl.UseProgram(r.hudGradProg)
 			gl.BindBuffer(gl.ARRAY_BUFFER, r.hudVBO)
 			gl.BindVertexArray(r.hudVAO)
 
-			// Health bar: x ∈ [-1, 0]
-			frac := float32(p.Health) / 100.0
-			if frac < 0 {
-				frac = 0
-			} else if frac > 1 {
-				frac = 1
+			drawBar := func(x0, x1, frac float32, kind int32) {
+				verts := [24]float32{
+					x0, -1, 0, 0,
+					x1, -1, 1, 0,
+					x1, -0.97, 1, 1,
+					x0, -1, 0, 0,
+					x1, -0.97, 1, 1,
+					x0, -0.97, 0, 1,
+				}
+				gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(verts)*4, unsafe.Pointer(&verts[0]))
+				gl.Uniform1f(r.hudFracLoc, frac)
+				gl.Uniform1i(r.hudKindLoc, kind)
+				gl.DrawArrays(gl.TRIANGLES, 0, 6)
 			}
-			healthVerts := [24]float32{
-				-1, -1, 0, 0,
-				0, -1, 1, 0,
-				0, -0.97, 1, 1,
-				-1, -1, 0, 0,
-				0, -0.97, 1, 1,
-				-1, -0.97, 0, 1,
-			}
-			gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(healthVerts)*4, unsafe.Pointer(&healthVerts[0]))
-			gl.Uniform1f(r.hudFracLoc, frac)
-			gl.DrawArrays(gl.TRIANGLES, 0, 6)
 
-			// Ammo bar: x ∈ [0, 1]
+			// Health bar: x ∈ [-1, -0.34]
+			healthFrac := float32(p.Health) / 100.0
+			if healthFrac < 0 {
+				healthFrac = 0
+			} else if healthFrac > 1 {
+				healthFrac = 1
+			}
+			drawBar(-1, -0.34, healthFrac, 0)
+
+			// Armor bar: x ∈ [-0.33, 0.33] — only drawn when player has armor
+			if p.Armor > 0 {
+				armorMax := float32(200) // item_armorInv cap
+				armorFrac := float32(p.Armor) / armorMax
+				if armorFrac > 1 {
+					armorFrac = 1
+				}
+				drawBar(-0.33, 0.33, armorFrac, 1)
+			}
+
+			// Ammo bar: x ∈ [0.34, 1]
 			cur, maxAmmo := p.CurrentWeaponAmmo()
 			ammoFrac := float32(0)
 			if maxAmmo > 0 {
@@ -907,17 +932,7 @@ func (r *Renderer) Draw(p *physics.Physics, width, height int) {
 					ammoFrac = 1
 				}
 			}
-			ammoVerts := [24]float32{
-				0, -1, 0, 0,
-				1, -1, 1, 0,
-				1, -0.97, 1, 1,
-				0, -1, 0, 0,
-				1, -0.97, 1, 1,
-				0, -0.97, 0, 1,
-			}
-			gl.BufferSubData(gl.ARRAY_BUFFER, 0, len(ammoVerts)*4, unsafe.Pointer(&ammoVerts[0]))
-			gl.Uniform1f(r.hudFracLoc, ammoFrac)
-			gl.DrawArrays(gl.TRIANGLES, 0, 6)
+			drawBar(0.34, 1, ammoFrac, 2)
 
 			gl.BindVertexArray(0)
 			gl.BindBuffer(gl.ARRAY_BUFFER, 0)

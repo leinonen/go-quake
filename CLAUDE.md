@@ -158,9 +158,23 @@ Draw order: world → brush entities → skybox → items/monsters → **particl
 
 The weapon is positioned in GL camera space via:
 - `RotX(-90) * RotZ(90)` — converts Quake view space (X=forward, -Y=right, Z=up) to GL camera space (-Z=forward, +X=right, +Y=up)
-- `Translate3D(0, -10, -10)` — places it in the lower-centre of the view
+- `Translate3D(weapBobH, -10+weapBobV, -10)` — base lower-centre placement plus bob offsets each frame
+- `HomogRotate3DZ(weapRoll)` — applies the smoothed camera roll at 0.75× scale
 
 The active VAO is selected each frame by `frame.Player.WeaponFrame`. If `progs/v_axe.mdl` is absent (standalone `.bsp` load), weapon rendering is silently skipped.
+
+## view bob and camera roll
+
+Computed in the renderer each frame (not physics); driven by `PlayerState.Velocity` and `PlayerState.OnGround`.
+
+**Bob phase**: advances at `hspeed / 320.0` cycles per second only when `OnGround && hspeed > 10`; frozen mid-cycle when airborne or still.
+
+**Bob offsets** (normalised amplitude = `hspeed / 320.0`):
+- Vertical: `sin(phase × 2π) × amp × 2.0` — ±2 units at full speed
+- Horizontal: `sin(phase × π) × amp × 1.0` — ±1 unit, half the frequency (one side-sway per two steps)
+- Applied to the eye position in world space; weapon bob uses 1.5× vertical and 1.2× horizontal
+
+**Camera roll**: strafe speed projected onto the right vector → target roll = `sideVel / 320 × 4°`; smoothed via exponential decay `smoothedRoll += (target − current) × (1 − exp(−8 × dt))`; applied by tilting the camera `up` vector. Weapon roll = `smoothedRoll × 0.75`.
 
 ## weapon firing
 
@@ -232,11 +246,12 @@ Drawn last (after weapon), depth test disabled. A static NDC quad covers the bot
 - Procedural skybox: direction-based FBM replaces Quake sky polygons entirely; no visible seams from any angle.
 - Procedural water: sin-warp + FBM replaces Quake water textures with animated caustics; screen-space blue-green tint when submerged.
 - View weapon: `v_axe.mdl` rendered in camera space with full swing animation and hit detection; hitscan weapons (shotgun through lightning gun) share the same firing input and auto-switch on empty ammo.
+- View bob and camera roll: camera bobs vertically (±2 units) and horizontally (±1 unit) when moving on ground, speed-scaled; camera tilts up to 4° when strafing via smoothed exponential decay; weapon position and roll track the view bob at slightly larger amplitude.
 - Item pickup: weapons, armor, ammo, health, and keys disappear on contact; health packs restore HP.
 - Monster AI: alert on LOS, chase with collision, gravity, melee attack, death; driven entirely in the physics goroutine.
 - Player respawn: death teleports back to spawn with full HP and reset monster alert state.
 - HUD health bar: NDC quad at screen bottom, green→red colour transition, driven by `uFrac` uniform.
-- Blood particles: axe hits spray ~80 physics-simulated GL_POINTS in a wide cone; pool of 2048 shared with sparks; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
+- Blood particles: axe and bullet hits spray 150 physics-simulated GL_POINTS in a wide cone; pool of 2048 shared with sparks; `allocParticle` evicts the lowest-life stuck decal when the pool is full so new hits always emit; each particle arcs under gravity and collides with BSP geometry via `HullTrace`; stuck decals linger ~7s then fade; rendered with alpha blending after skybox before weapon depth-clear.
 - Wall sparks: hitscan pellets that strike BSP geometry emit 12 orange spark particles (`particleKindSpark`) per pellet; share the 2048-slot particle pool with blood; stuck decals fade in 2s; fragment shader branches on `vKind` for colour (orange→grey vs red).
 - Bullet tracers: each hitscan pellet emits a `tracer` line segment from the weapon muzzle (`muzzlePos`: eye + forward×10 − up×10) to the impact point; pool of 128; lifetime 50 ms; exported as `[]TracerState` (normalised life); rendered as `GL_LINES` with additive blending (`GL_ONE`) in `tracer.vert/frag.glsl`.
 - Flame entities: `light_flame_large_yellow`, `light_flame_small_yellow`, `light_flame_large_white`, `light_flame_small_white` parsed from the entity lump; rendered as looping `flame2.mdl` animation via the existing `itemVAOs` path; no AI, no collision, no pickup.
@@ -252,9 +267,10 @@ Pool of 2048 `particle` structs (blood + sparks) owned by the physics goroutine 
   - No hit → advance `Pos`
 - **Stuck:** no movement; just fade
 
+**Allocation** (`allocParticle`): shared by both emitters; scans from `nextFreeHint` (amortised cursor) for a free slot; if the pool is full, evicts the stuck decal with the lowest remaining life — new flying particles always get a slot.
+
 **Blood** (`emitBloodParticles`): called from `tryAxeHit` on monster hit and from `fireHitscan` on monster hit:
-- Scans `particles[]` from `nextFreeHint` (amortised cursor) for free slots
-- Sprays `particleEmitCount=80` particles with random cone spread (`particleSpread=1.4`) around the forward vector; speed `350 * rand(0.5..1.0)` units/s
+- Sprays `particleEmitCount=150` particles with random cone spread (`particleSpread=2.2`) around the forward vector; speed `550 * rand(0.5..1.0)` units/s
 
 **Sparks** (`emitWallSparks`): called from `fireHitscan` when a pellet hits BSP geometry (no closer monster hit):
 - Sprays `sparkEmitCount=12` particles in the hemisphere around the surface normal; speed `300 * rand(0.5..1.0)` units/s; spread factor 1.2
@@ -307,7 +323,7 @@ OpenAL-based audio via cgo (`-lopenal`). All sounds are loaded from the PAK file
 
 - `CountVisible()` does a GPU→CPU readback every 30 frames (debug only); replace with `glMultiDrawArraysIndirect` for fully GPU-resident pipeline
 - Doors linked by `target`/`targetname` are not grouped (each panel opens independently)
-- No view bob or weapon kick animation
+- No weapon kick animation on fire
 - Monster AI is purely melee — no ranged attacks, no projectiles
 - Monsters have no death animation (disappear instantly on HP ≤ 0)
 - No enemy variety in combat behaviour (all monsters use identical melee AI regardless of type)

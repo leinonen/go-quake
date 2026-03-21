@@ -24,9 +24,9 @@ const (
 	particleCount     = 2048
 	particleFlyLife   = 4.0   // seconds airborne
 	particleStuckLife = 7.0   // seconds as decal
-	particleSpeed     = 350.0 // units/s base spray speed
-	particleSpread    = 1.4   // lateral cone factor
-	particleEmitCount = 80    // per hit
+	particleSpeed     = 550.0 // units/s base spray speed
+	particleSpread    = 2.2   // lateral cone factor
+	particleEmitCount = 150   // per hit
 
 	particleKindBlood = 0
 	particleKindSpark = 1
